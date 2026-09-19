@@ -1,5 +1,0 @@
-torch
-torchtext
-torchdata==0.9.0
-spacy
-portalocker
