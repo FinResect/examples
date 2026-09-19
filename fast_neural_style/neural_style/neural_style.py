@@ -48,7 +48,7 @@ def train(args):
     train_dataset = datasets.ImageFolder(args.dataset, transform)
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size)
 
-    transformer = TransformerNet().to(device)
+    transformer = TransformerNet(width=args.width).to(device)
     optimizer = Adam(transformer.parameters(), args.lr)
     mse_loss = torch.nn.MSELoss()
 
@@ -144,7 +144,7 @@ def stylize(args):
         output = stylize_onnx(content_image, args)
     else:
         with torch.no_grad():
-            style_model = TransformerNet()
+            style_model = TransformerNet(width=args.width)
             state_dict = torch.load(args.model)
             # remove saved deprecated running_* keys in InstanceNorm from the checkpoint
             for k in list(state_dict.keys()):
@@ -224,6 +224,9 @@ def main():
                                   help="number of images after which the training loss is logged, default is 500")
     train_arg_parser.add_argument("--checkpoint-interval", type=int, default=2000,
                                   help="number of batches after which a checkpoint of the trained model will be created")
+    train_arg_parser.add_argument("--width", type=float, default=1.0,
+                                  help="channel width multiplier for TransformerNet, default is 1.0 "
+                                       "(use 0.25 for 1/4 channels)")
 
     eval_arg_parser = subparsers.add_parser("eval", help="parser for evaluation/stylizing arguments")
     eval_arg_parser.add_argument("--content-image", type=str, required=True,
@@ -237,7 +240,10 @@ def main():
     eval_arg_parser.add_argument("--export_onnx", type=str,
                                  help="export ONNX model to a given file")
     eval_arg_parser.add_argument('--accel', action='store_true',
-                                 help='use accelerator')
+                                  help='use accelerator')
+    eval_arg_parser.add_argument("--width", type=float, default=1.0,
+                                  help="channel width multiplier for TransformerNet, default is 1.0 "
+                                       "(must match the value used during training)")
 
     args = main_arg_parser.parse_args()
 
