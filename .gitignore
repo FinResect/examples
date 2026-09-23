@@ -23,3 +23,6 @@ docs/venv
 # development
 .vscode
 **/.DS_Store
+
+fast_neural_style/images/dataset/*
+fast_neural_style/vgg16-397923af.pth
