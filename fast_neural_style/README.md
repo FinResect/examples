@@ -43,12 +43,18 @@ ranges are candidate constraints and have not been validated together locally.
 
 ```bash
 python -m pip install -r requirements-convert.txt
-python script/model2tf_lite.py \
+CUDA_VISIBLE_DEVICES=-1 TF_ENABLE_ONEDNN_OPTS=0 python script/model2tf_lite.py \
   --model outputs/models/ti60_epoch_2_TIMESTAMP.model \
   --calib /data/calibration --calib-count 100 \
   --onnx outputs/style.onnx --saved-model outputs/saved_model \
   --int8-tflite outputs/style_int8.tflite
 ```
+
+The environment variables select CPU execution and disable oneDNN optimizations
+for this conversion command and its children. This avoids the GPU/CPU parity
+failure observed on the training server without changing trained weights or
+loosening tolerances. See the Chinese guide for the server command, report
+inspection, preview paths and explanations of common TensorFlow log messages.
 
 Conversion checks numerical parity, exports static NHWC INT8 IO and writes a JSON
 operator/quantization report. Unexpected operators fail the audit. Exit zero means
