@@ -60,7 +60,7 @@ class TransformerNet(nn.Module):
             if isinstance(layer, ConvLayer) and isinstance(layer.bn, nn.BatchNorm2d):
                 layer.conv = nn.utils.fusion.fuse_conv_bn_eval(layer.conv, layer.bn)
                 layer.bn = nn.Identity()
-        return model
+        return model.eval()
 
 
 def save_checkpoint(path, model, image_size, **extra):

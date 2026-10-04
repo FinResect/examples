@@ -77,6 +77,8 @@ class ModelTests(unittest.TestCase):
                     layer.weight.uniform_(0.5, 1.5)
                     layer.bias.uniform_(-0.2, 0.2)
             fused = net.fused()
+            self.assertIsNot(fused, net)
+            self.assertFalse(any(module.training for module in fused.modules()))
             self.assertFalse(any(isinstance(m, torch.nn.BatchNorm2d) for m in fused.modules()))
             self.assertEqual(sum(isinstance(m, torch.nn.Conv2d) for m in fused.modules()), 16)
             for size in (16, 128):
