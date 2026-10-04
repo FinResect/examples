@@ -1,6 +1,6 @@
 import torch
 
-model_path = "/root/gpufree-data/FPGA/examples/fast_neural_style/model/one_last_kiss_style.model"
+model_path = "/root/gpufree-data/FPGA/examples/fast_neural_style/model/one_last_kiss_style_full.model"
 checkpoint = torch.load(model_path, map_location="cpu")
 
 if isinstance(checkpoint, dict):
