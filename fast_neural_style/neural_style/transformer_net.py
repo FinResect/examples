@@ -1,102 +1,87 @@
+import copy
+import math
+
 import torch
+from torch import nn
 
 
-class TransformerNet(torch.nn.Module):
-    def __init__(self, width=1.0):
-        super(TransformerNet, self).__init__()
-        c1 = int(32 * width)
-        c2 = int(64 * width)
-        c3 = int(128 * width)
-        # Initial convolution layers
-        self.conv1 = ConvLayer(3, c1, kernel_size=9, stride=1)
-        self.in1 = torch.nn.InstanceNorm2d(c1, affine=True)
-        self.conv2 = ConvLayer(c1, c2, kernel_size=3, stride=2)
-        self.in2 = torch.nn.InstanceNorm2d(c2, affine=True)
-        self.conv3 = ConvLayer(c2, c3, kernel_size=3, stride=2)
-        self.in3 = torch.nn.InstanceNorm2d(c3, affine=True)
-        # Residual layers
-        self.res1 = ResidualBlock(c3)
-        self.res2 = ResidualBlock(c3)
-        self.res3 = ResidualBlock(c3)
-        self.res4 = ResidualBlock(c3)
-        self.res5 = ResidualBlock(c3)
-        # Upsampling Layers
-        self.deconv1 = UpsampleConvLayer(c3, c2, kernel_size=3, stride=1, upsample=2)
-        self.in4 = torch.nn.InstanceNorm2d(c2, affine=True)
-        self.deconv2 = UpsampleConvLayer(c2, c1, kernel_size=3, stride=1, upsample=2)
-        self.in5 = torch.nn.InstanceNorm2d(c1, affine=True)
-        self.deconv3 = ConvLayer(c1, 3, kernel_size=9, stride=1)
-        # Non-linearities
-        self.relu = torch.nn.ReLU()
-
-    def forward(self, X):
-        y = self.relu(self.in1(self.conv1(X)))
-        y = self.relu(self.in2(self.conv2(y)))
-        y = self.relu(self.in3(self.conv3(y)))
-        y = self.res1(y)
-        y = self.res2(y)
-        y = self.res3(y)
-        y = self.res4(y)
-        y = self.res5(y)
-        y = self.relu(self.in4(self.deconv1(y)))
-        y = self.relu(self.in5(self.deconv2(y)))
-        y = self.deconv3(y)
-        return y
+ARCHITECTURE = "ti60_style_bn_3x3_v1"
 
 
-class ConvLayer(torch.nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, stride):
-        super(ConvLayer, self).__init__()
-        reflection_padding = kernel_size // 2
-        self.reflection_pad = torch.nn.ReflectionPad2d(reflection_padding)
-        self.conv2d = torch.nn.Conv2d(in_channels, out_channels, kernel_size, stride)
+class ConvLayer(nn.Module):
+    def __init__(self, in_channels, out_channels, stride=1, normalize=True):
+        super().__init__()
+        # For even inputs, TF SAME stride=2 pads only the right and bottom.
+        self.pad = nn.ZeroPad2d((0, 1, 0, 1)) if stride == 2 else nn.Identity()
+        self.conv = nn.Conv2d(in_channels, out_channels, 3, stride,
+                              padding=1 if stride == 1 else 0)
+        self.bn = nn.BatchNorm2d(out_channels) if normalize else nn.Identity()
 
     def forward(self, x):
-        out = self.reflection_pad(x)
-        out = self.conv2d(out)
-        return out
+        return self.bn(self.conv(self.pad(x)))
 
 
-class ResidualBlock(torch.nn.Module):
-    """ResidualBlock
-    introduced in: https://arxiv.org/abs/1512.03385
-    recommended architecture: http://torch.ch/blog/2016/02/04/resnets.html
-    """
-
+class ResidualBlock(nn.Module):
     def __init__(self, channels):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = ConvLayer(channels, channels, kernel_size=3, stride=1)
-        self.in1 = torch.nn.InstanceNorm2d(channels, affine=True)
-        self.conv2 = ConvLayer(channels, channels, kernel_size=3, stride=1)
-        self.in2 = torch.nn.InstanceNorm2d(channels, affine=True)
-        self.relu = torch.nn.ReLU()
+        super().__init__()
+        self.conv1 = ConvLayer(channels, channels)
+        self.conv2 = ConvLayer(channels, channels)
 
     def forward(self, x):
-        residual = x
-        out = self.relu(self.in1(self.conv1(x)))
-        out = self.in2(self.conv2(out))
-        out = out + residual
-        return out
+        return x + self.conv2(torch.relu(self.conv1(x)))
 
 
-class UpsampleConvLayer(torch.nn.Module):
-    """UpsampleConvLayer
-    Upsamples the input and then does a convolution. This method gives better results
-    compared to ConvTranspose2d.
-    ref: http://distill.pub/2016/deconv-checkerboard/
-    """
-
-    def __init__(self, in_channels, out_channels, kernel_size, stride, upsample=None):
-        super(UpsampleConvLayer, self).__init__()
-        self.upsample = upsample
-        reflection_padding = kernel_size // 2
-        self.reflection_pad = torch.nn.ReflectionPad2d(reflection_padding)
-        self.conv2d = torch.nn.Conv2d(in_channels, out_channels, kernel_size, stride)
+class TransformerNet(nn.Module):
+    def __init__(self, width=0.25):
+        super().__init__()
+        if not math.isfinite(width) or width <= 0 or int(32 * width) < 1:
+            raise ValueError("width must produce at least one channel")
+        self.width = width
+        c1, c2, c3 = (int(c * width) for c in (32, 64, 128))
+        self.conv1 = ConvLayer(3, c1)
+        self.conv2 = ConvLayer(c1, c2, stride=2)
+        self.conv3 = ConvLayer(c2, c3, stride=2)
+        self.residuals = nn.Sequential(*(ResidualBlock(c3) for _ in range(5)))
+        self.up1 = ConvLayer(c3, c2)
+        self.up2 = ConvLayer(c2, c1)
+        self.output = ConvLayer(c1, 3, normalize=False)
 
     def forward(self, x):
-        x_in = x
-        if self.upsample:
-            x_in = torch.nn.functional.interpolate(x_in, mode='nearest', scale_factor=self.upsample)
-        out = self.reflection_pad(x_in)
-        out = self.conv2d(out)
-        return out
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = self.residuals(torch.relu(self.conv3(x)))
+        x = torch.relu(self.up1(nn.functional.interpolate(x, scale_factor=2, mode="nearest")))
+        x = torch.relu(self.up2(nn.functional.interpolate(x, scale_factor=2, mode="nearest")))
+        return self.output(x)
+
+    def fused(self):
+        model = copy.deepcopy(self).eval()
+        for layer in model.modules():
+            if isinstance(layer, ConvLayer) and isinstance(layer.bn, nn.BatchNorm2d):
+                layer.conv = nn.utils.fusion.fuse_conv_bn_eval(layer.conv, layer.bn)
+                layer.bn = nn.Identity()
+        return model
+
+
+def save_checkpoint(path, model, image_size, **extra):
+    torch.save({
+        "metadata": {"architecture": ARCHITECTURE, "width": model.width,
+                     "image_size": image_size},
+        "state_dict": {key: value.detach().cpu() for key, value in model.state_dict().items()},
+        **extra,
+    }, path)
+
+
+def load_checkpoint(path):
+    checkpoint = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(checkpoint, dict) or "metadata" not in checkpoint:
+        raise ValueError("Legacy InstanceNorm/raw state_dict models are incompatible; retrain the Ti60 model")
+    metadata = checkpoint["metadata"]
+    if metadata.get("architecture") != ARCHITECTURE:
+        raise ValueError("Unsupported checkpoint architecture")
+    size = metadata.get("image_size")
+    if not isinstance(size, int) or size < 16 or size % 4:
+        raise ValueError("Checkpoint image_size must be >=16 and divisible by four")
+    model = TransformerNet(metadata["width"])
+    model.load_state_dict(checkpoint["state_dict"], strict=True)
+    return model.eval(), metadata

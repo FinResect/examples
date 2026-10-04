@@ -1,20 +1,21 @@
-import torch
+"""Report parameters in a metadata-bearing Ti60 checkpoint."""
+import argparse
+from pathlib import Path
+import sys
 
-model_path = "/root/gpufree-data/FPGA/examples/fast_neural_style/model/one_last_kiss_style_full.model"
-checkpoint = torch.load(model_path, map_location="cpu")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-if isinstance(checkpoint, dict):
-    # 有些模型会包一层 state_dict 或 model
-    if "state_dict" in checkpoint:
-        state_dict = checkpoint["state_dict"]
-    elif "model" in checkpoint:
-        state_dict = checkpoint["model"]
-    else:
-        state_dict = checkpoint
-    total_params = sum(v.numel() for v in state_dict.values() if torch.is_tensor(v))
-else:
-    total_params = sum(p.numel() for p in checkpoint.parameters())
 
-print(f"总参数量: {total_params}")
-print(f"约 {total_params / 1e6:.3f} M")
-print(f"是否小于 500K: {total_params < 500_000}")
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", required=True)
+    args = parser.parse_args()
+    from neural_style.transformer_net import load_checkpoint
+    model, metadata = load_checkpoint(args.model)
+    print(f"Metadata: {metadata}")
+    print(f"Trainable parameters (excludes BN buffers): {sum(p.numel() for p in model.parameters())}")
+    print(f"Folded inference parameters: {sum(p.numel() for p in model.fused().parameters())}")
+
+
+if __name__ == "__main__":
+    main()

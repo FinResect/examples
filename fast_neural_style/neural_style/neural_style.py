@@ -1,266 +1,140 @@
 import argparse
-import os
-import sys
+from pathlib import Path
 import time
-import re
 
 import numpy as np
 import torch
-from torch.optim import Adam
 from torch.utils.data import DataLoader
-from torchvision import datasets
-from torchvision import transforms
-import torch.onnx
+from torchvision import datasets, transforms
 
 import utils
-from transformer_net import TransformerNet
-from vgg import Vgg16
+from transformer_net import TransformerNet, load_checkpoint, save_checkpoint
 
 
-def check_paths(args):
-    try:
-        if not os.path.exists(args.save_model_dir):
-            os.makedirs(args.save_model_dir)
-        if args.checkpoint_model_dir is not None and not (os.path.exists(args.checkpoint_model_dir)):
-            os.makedirs(args.checkpoint_model_dir)
-    except OSError as e:
-        print(e)
-        sys.exit(1)
+def image_transform(size):
+    return transforms.Compose([
+        transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.CenterCrop(size), transforms.ToTensor(),
+    ])
 
 
-def train(args):
-    if args.accel:
-        device = torch.accelerator.current_accelerator()
-    else:
-        device = torch.device("cpu")
+def train(args, device):
+    from vgg import Vgg16
 
-    print(f"Using device: {device}")
-
-    np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    dataset = datasets.ImageFolder(args.dataset, image_transform(args.image_size))
+    loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
+                        num_workers=args.workers, pin_memory=device.type == "cuda")
+    model = TransformerNet(args.width).to(device).train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
+    vgg = Vgg16(requires_grad=False).to(device).eval()
+    style = image_transform(args.style_size or args.image_size)(
+        utils.load_image(args.style_image)).unsqueeze(0).to(device) * 255
+    with torch.no_grad():
+        style_grams = [utils.gram_matrix(f) for f in vgg(utils.normalize_batch(style))]
+    loss_fn = torch.nn.MSELoss()
+    output_dir = Path(args.save_model_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir = Path(args.checkpoint_model_dir) if args.checkpoint_model_dir else None
+    if checkpoint_dir:
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    transform = transforms.Compose([
-        transforms.Resize(args.image_size),
-        transforms.CenterCrop(args.image_size),
-        transforms.ToTensor(),
-        transforms.Lambda(lambda x: x.mul(255))
-    ])
-    train_dataset = datasets.ImageFolder(args.dataset, transform)
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size)
-
-    transformer = TransformerNet(width=args.width).to(device)
-    optimizer = Adam(transformer.parameters(), args.lr)
-    mse_loss = torch.nn.MSELoss()
-
-    vgg = Vgg16(requires_grad=False).to(device)
-    style_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda x: x.mul(255))
-    ])
-    style = utils.load_image(args.style_image, size=args.style_size)
-    style = style_transform(style)
-    style = style.repeat(args.batch_size, 1, 1, 1).to(device)
-
-    features_style = vgg(utils.normalize_batch(style))
-    gram_style = [utils.gram_matrix(y) for y in features_style]
-
-    for e in range(args.epochs):
-        transformer.train()
-        agg_content_loss = 0.
-        agg_style_loss = 0.
-        count = 0
-        for batch_id, (x, _) in enumerate(train_loader):
-            n_batch = len(x)
-            count += n_batch
-            optimizer.zero_grad()
-
-            x = x.to(device)
-            y = transformer(x)
-
-            y = utils.normalize_batch(y)
-            x = utils.normalize_batch(x)
-
-            features_y = vgg(y)
-            features_x = vgg(x)
-
-            content_loss = args.content_weight * mse_loss(features_y.relu2_2, features_x.relu2_2)
-
-            style_loss = 0.
-            for ft_y, gm_s in zip(features_y, gram_style):
-                gm_y = utils.gram_matrix(ft_y)
-                style_loss += mse_loss(gm_y, gm_s[:n_batch, :, :])
-            style_loss *= args.style_weight
-
-            total_loss = content_loss + style_loss
-            total_loss.backward()
+    for epoch in range(1, args.epochs + 1):
+        totals = np.zeros(2)
+        samples = 0
+        for step, (images, _) in enumerate(loader, 1):
+            x = images.to(device, non_blocking=True) * 255
+            optimizer.zero_grad(set_to_none=True)
+            y = model(x)
+            features_y = vgg(utils.normalize_batch(y))
+            with torch.no_grad():
+                features_x = vgg(utils.normalize_batch(x))
+            content_loss = args.content_weight * loss_fn(features_y.relu2_2, features_x.relu2_2)
+            style_loss = args.style_weight * sum(
+                loss_fn(utils.gram_matrix(f), target.expand(x.shape[0], -1, -1))
+                for f, target in zip(features_y, style_grams))
+            loss = content_loss + style_loss
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite loss at epoch {epoch}, batch {step}")
+            loss.backward()
             optimizer.step()
-
-            agg_content_loss += content_loss.item()
-            agg_style_loss += style_loss.item()
-
-            if (batch_id + 1) % args.log_interval == 0:
-                mesg = "{}\tEpoch {}:\t[{}/{}]\tcontent: {:.6f}\tstyle: {:.6f}\ttotal: {:.6f}".format(
-                    time.ctime(), e + 1, count, len(train_dataset),
-                                  agg_content_loss / (batch_id + 1),
-                                  agg_style_loss / (batch_id + 1),
-                                  (agg_content_loss + agg_style_loss) / (batch_id + 1)
-                )
-                print(mesg)
-
-            if args.checkpoint_model_dir is not None and (batch_id + 1) % args.checkpoint_interval == 0:
-                transformer.eval().cpu()
-                ckpt_model_filename = "ckpt_epoch_" + str(e) + "_batch_id_" + str(batch_id + 1) + ".pth"
-                ckpt_model_path = os.path.join(args.checkpoint_model_dir, ckpt_model_filename)
-                torch.save(transformer.state_dict(), ckpt_model_path)
-                transformer.to(device).train()
-
-    # save model
-    transformer.eval().cpu()
-    timestamp = time.strftime("%Y-%m-%d_%H-%M-%S")
-    save_model_filename = f"epoch_{args.epochs}_{timestamp}_{args.content_weight}_{args.style_weight}.model"
-    save_model_path = os.path.join(args.save_model_dir, save_model_filename)
-    torch.save(transformer.state_dict(), save_model_path)
-
-    print("\nDone, trained model saved at", save_model_path)
+            totals += np.array([content_loss.item(), style_loss.item()]) * x.shape[0]
+            samples += x.shape[0]
+            if step % args.log_interval == 0 or step == len(loader):
+                print(f"epoch={epoch} batch={step}/{len(loader)} "
+                      f"content={totals[0]/samples:.6f} style={totals[1]/samples:.6f}", flush=True)
+            if checkpoint_dir and step % args.checkpoint_interval == 0:
+                save_checkpoint(checkpoint_dir / f"epoch_{epoch}_batch_{step}.model",
+                                model, args.image_size, epoch=epoch, batch=step)
+        path = output_dir / f"ti60_epoch_{epoch}_{time.strftime('%Y%m%d_%H%M%S')}.model"
+        save_checkpoint(path, model, args.image_size, epoch=epoch)
+        print(f"Saved {path}", flush=True)
 
 
-def stylize(args):
-    if args.accel:
-        device = torch.accelerator.current_accelerator()
-    else:
-        device = torch.device("cpu")
-    
-    print(f"Using device: {device}")
-
-    content_image = utils.load_image(args.content_image, scale=args.content_scale)
-    content_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Lambda(lambda x: x.mul(255))
-    ])
-    content_image = content_transform(content_image)
-    content_image = content_image.unsqueeze(0).to(device)
-
-    if args.model.endswith(".onnx"):
-        output = stylize_onnx(content_image, args)
-    else:
-        with torch.no_grad():
-            style_model = TransformerNet(width=args.width)
-            state_dict = torch.load(args.model)
-            # remove saved deprecated running_* keys in InstanceNorm from the checkpoint
-            for k in list(state_dict.keys()):
-                if re.search(r'in\d+\.running_(mean|var)$', k):
-                    del state_dict[k]
-            style_model.load_state_dict(state_dict)
-            style_model.to(device)
-            style_model.eval()
-            if args.export_onnx:
-                assert args.export_onnx.endswith(".onnx"), "Export model file should end with .onnx"
-                output = torch.onnx._export(
-                    style_model, content_image, args.export_onnx, opset_version=11,
-                ).cpu()            
-            else:
-                output = style_model(content_image).cpu()
+def stylize(args, device):
+    model, metadata = load_checkpoint(args.model)
+    if args.width is not None and args.width != metadata["width"]:
+        raise ValueError("--width does not match checkpoint metadata")
+    size = args.image_size or metadata["image_size"]
+    if size < 16 or size % 4:
+        raise ValueError("image-size must be >=16 and divisible by four")
+    x = image_transform(size)(utils.load_image(args.content_image)).unsqueeze(0) * 255
+    model = model.fused().to(device)
+    with torch.inference_mode():
+        output = model(x.to(device)).cpu()
+    Path(args.output_image).parent.mkdir(parents=True, exist_ok=True)
     utils.save_image(args.output_image, output[0])
-
-
-def stylize_onnx(content_image, args):
-    """
-    Read ONNX model and run it using onnxruntime
-    """
-
-    assert not args.export_onnx
-
-    import onnxruntime
-
-    ort_session = onnxruntime.InferenceSession(args.model)
-
-    def to_numpy(tensor):
-        return (
-            tensor.detach().cpu().numpy()
-            if tensor.requires_grad
-            else tensor.cpu().numpy()
-        )
-
-    ort_inputs = {ort_session.get_inputs()[0].name: to_numpy(content_image)}
-    ort_outs = ort_session.run(None, ort_inputs)
-    img_out_y = ort_outs[0]
-
-    return torch.from_numpy(img_out_y)
+    if args.export_onnx:
+        Path(args.export_onnx).parent.mkdir(parents=True, exist_ok=True)
+        torch.onnx.export(model.cpu(), x, args.export_onnx, opset_version=13,
+                          input_names=["input"], output_names=["output"], dynamo=False)
 
 
 def main():
-    main_arg_parser = argparse.ArgumentParser(description="parser for fast-neural-style")
-    subparsers = main_arg_parser.add_subparsers(title="subcommands", dest="subcommand")
-
-    train_arg_parser = subparsers.add_parser("train", help="parser for training arguments")
-    train_arg_parser.add_argument("--epochs", type=int, default=2,
-                                  help="number of training epochs, default is 2")
-    train_arg_parser.add_argument("--batch-size", type=int, default=4,
-                                  help="batch size for training, default is 4")
-    train_arg_parser.add_argument("--dataset", type=str, required=True,
-                                  help="path to training dataset, the path should point to a folder "
-                                       "containing another folder with all the training images")
-    train_arg_parser.add_argument("--style-image", type=str, default="images/style-images/mosaic.jpg",
-                                  help="path to style-image")
-    train_arg_parser.add_argument("--save-model-dir", type=str, required=True,
-                                  help="path to folder where trained model will be saved.")
-    train_arg_parser.add_argument("--checkpoint-model-dir", type=str, default=None,
-                                  help="path to folder where checkpoints of trained models will be saved")
-    train_arg_parser.add_argument("--image-size", type=int, default=256,
-                                  help="size of training images, default is 256 X 256")
-    train_arg_parser.add_argument("--style-size", type=int, default=None,
-                                  help="size of style-image, default is the original size of style image")
-    train_arg_parser.add_argument('--accel', action='store_true',
-                                  help='use accelerator')
-    train_arg_parser.add_argument("--seed", type=int, default=42,
-                                  help="random seed for training")
-    train_arg_parser.add_argument("--content-weight", type=float, default=1e5,
-                                  help="weight for content-loss, default is 1e5")
-    train_arg_parser.add_argument("--style-weight", type=float, default=1e10,
-                                  help="weight for style-loss, default is 1e10")
-    train_arg_parser.add_argument("--lr", type=float, default=1e-3,
-                                  help="learning rate, default is 1e-3")
-    train_arg_parser.add_argument("--log-interval", type=int, default=500,
-                                  help="number of images after which the training loss is logged, default is 500")
-    train_arg_parser.add_argument("--checkpoint-interval", type=int, default=2000,
-                                  help="number of batches after which a checkpoint of the trained model will be created")
-    train_arg_parser.add_argument("--width", type=float, default=1.0,
-                                  help="channel width multiplier for TransformerNet, default is 1.0 "
-                                       "(use 0.25 for 1/4 channels)")
-
-    eval_arg_parser = subparsers.add_parser("eval", help="parser for evaluation/stylizing arguments")
-    eval_arg_parser.add_argument("--content-image", type=str, required=True,
-                                 help="path to content image you want to stylize")
-    eval_arg_parser.add_argument("--content-scale", type=float, default=None,
-                                 help="factor for scaling down the content image")
-    eval_arg_parser.add_argument("--output-image", type=str, required=True,
-                                 help="path for saving the output image")
-    eval_arg_parser.add_argument("--model", type=str, required=True,
-                                 help="saved model to be used for stylizing the image. If file ends in .pth - PyTorch path is used, if in .onnx - Caffe2 path")
-    eval_arg_parser.add_argument("--export_onnx", type=str,
-                                 help="export ONNX model to a given file")
-    eval_arg_parser.add_argument('--accel', action='store_true',
-                                  help='use accelerator')
-    eval_arg_parser.add_argument("--width", type=float, default=1.0,
-                                  help="channel width multiplier for TransformerNet, default is 1.0 "
-                                       "(must match the value used during training)")
-
-    args = main_arg_parser.parse_args()
-
-    if args.subcommand is None:
-        print("ERROR: specify either train or eval")
-        sys.exit(1)
-    if args.accel and not torch.accelerator.is_available():
-        print("ERROR: accelerator is not available, try running on CPU")
-        sys.exit(1)
-    if not args.accel and torch.accelerator.is_available():
-        print("WARNING: accelerator is available, run with --accel to enable it")
-
-    if args.subcommand == "train":
-        check_paths(args)
-        train(args)
+    parser = argparse.ArgumentParser(description="Ti60 3x3/BN style transfer")
+    commands = parser.add_subparsers(dest="command", required=True)
+    training = commands.add_parser("train")
+    training.add_argument("--dataset", required=True)
+    training.add_argument("--style-image", required=True)
+    training.add_argument("--save-model-dir", required=True)
+    training.add_argument("--checkpoint-model-dir")
+    training.add_argument("--epochs", type=int, default=2)
+    training.add_argument("--batch-size", type=int, default=4)
+    training.add_argument("--image-size", type=int, default=128)
+    training.add_argument("--style-size", type=int)
+    training.add_argument("--width", type=float, default=0.25)
+    training.add_argument("--workers", type=int, default=4)
+    training.add_argument("--seed", type=int, default=42)
+    training.add_argument("--content-weight", type=float, default=1e5)
+    training.add_argument("--style-weight", type=float, default=1e10)
+    training.add_argument("--lr", type=float, default=1e-3)
+    training.add_argument("--log-interval", type=int, default=100)
+    training.add_argument("--checkpoint-interval", type=int, default=2000)
+    evaluation = commands.add_parser("eval")
+    evaluation.add_argument("--model", required=True)
+    evaluation.add_argument("--content-image", required=True)
+    evaluation.add_argument("--output-image", required=True)
+    evaluation.add_argument("--image-size", type=int)
+    evaluation.add_argument("--width", type=float)
+    evaluation.add_argument("--export-onnx", "--export_onnx", dest="export_onnx")
+    for command in (training, evaluation):
+        command.add_argument("--accel", action="store_true", help="use CUDA (server training)")
+    args = parser.parse_args()
+    if args.accel and not torch.cuda.is_available():
+        parser.error("--accel requested but CUDA is unavailable")
+    device = torch.device("cuda" if args.accel else "cpu")
+    print(f"Using device: {device}")
+    if args.command == "train":
+        if args.image_size < 16 or args.image_size % 4:
+            parser.error("--image-size must be >=16 and divisible by four")
+        if min(args.epochs, args.batch_size, args.log_interval, args.checkpoint_interval) < 1 or args.workers < 0:
+            parser.error("epochs, batch-size and intervals must be positive; workers must be nonnegative")
+        if args.style_size is not None and args.style_size < 16:
+            parser.error("--style-size must be >=16")
+        train(args, device)
     else:
-        stylize(args)
+        stylize(args, device)
 
 
 if __name__ == "__main__":

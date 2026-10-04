@@ -1,0 +1,19 @@
+# Conversion-only dependencies; install in a separate environment.
+# These version ranges are candidate constraints, NOT empirically validated as
+# a complete stack. Resolve/test together for your Python/platform, then freeze
+# that working environment. The base requirements retain torch/torchvision.
+-r requirements.txt
+numpy>=1.26,<2
+Pillow>=10,<12
+onnx>=1.16,<1.18
+onnxruntime>=1.18,<1.21
+tensorflow>=2.16,<2.19
+tf-keras>=2.16,<2.19
+onnx2tf>=1.26,<1.27
+onnxsim>=0.4.33,<0.5
+onnx-graphsurgeon>=0.5,<0.6
+sng4onnx>=1.0.1,<2
+psutil>=5.9,<7
+flatbuffers>=24.3.25
+# Public generated TFLite FlatBuffer schema, used to audit all subgraphs.
+tflite>=2.10,<3

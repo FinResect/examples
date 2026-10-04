@@ -1,66 +1,71 @@
-# fast-neural-style :city_sunrise: :rocket:
+# Ti60 Fast Neural Style
 
-This repository contains a pytorch implementation of an algorithm for artistic style transfer. The algorithm can be used to mix the content of an image with the style of another image. For example, here is a photograph of a door arch rendered in the style of a stained glass painting.
+This fork prepares style-transfer models for Ti60F225I3 TinyML deployment.
+See [the Chinese training and deployment guide](使用说明.md) for the full workflow,
+calibration, operator audit, resource estimates and hardware integration requirements.
 
-The model uses the method described in [Perceptual Losses for Real-Time Style Transfer and Super-Resolution](https://arxiv.org/abs/1603.08155) along with [Instance Normalization](https://arxiv.org/pdf/1607.08022.pdf). The saved-models for examples shown in the README can be downloaded from [here](https://www.dropbox.com/s/lrvwfehqdcxoza8/saved_models.zip?dl=0).
+The default model uses width 0.25 (8/16/32 channels), 128x128 RGB images,
+sixteen 3x3 convolutions, five residual blocks, BatchNorm folded before export,
+zero SAME padding and two nearest-neighbor upsampling stages.
+The perceptual loss follows [Perceptual Losses for Real-Time Style Transfer](https://arxiv.org/abs/1603.08155).
+VGG16 is used only during training and is not exported.
 
-<p align="center">
-    <img src="images/style-images/mosaic.jpg" height="200px">
-    <img src="images/content-images/amber.jpg" height="200px">
-    <img src="images/output-images/amber-mosaic.jpg" height="440px">
-</p>
+## Training
 
-## Requirements
-
-The program is written in Python, and uses [pytorch](http://pytorch.org/), [scipy](https://www.scipy.org). A GPU is not necessary, but can provide a significant speed up especially for training a new model. Regular sized images can be styled on a laptop or desktop using saved models.
-
-## Usage
-
-Stylize image
-
-```
-python neural_style/neural_style.py eval --content-image </path/to/content/image> --model </path/to/saved/model> --output-image </path/to/output/image> --accel
-```
-
-- `--content-image`: path to content image you want to stylize.
-- `--model`: saved model to be used for stylizing the image (eg: `mosaic.pth`)
-- `--output-image`: path for saving the output image.
-- `--content-scale`: factor for scaling down the content image if memory is an issue (eg: value of 2 will halve the height and width of content-image)
-- `--accel`: use accelerator
-
-Train model
+Run from this directory. Install a matching CUDA PyTorch/torchvision pair on the
+server, then install `requirements.txt`. The dataset uses ImageFolder subdirectories.
 
 ```bash
-python neural_style/neural_style.py train --dataset </path/to/train-dataset> --style-image </path/to/style/image> --save-model-dir </path/to/save-model/folder> --epochs 2 --accel
+python -m pip install -r requirements.txt
+python neural_style/neural_style.py train \
+  --dataset /data/content \
+  --style-image images/style-images/mosaic.jpg \
+  --save-model-dir outputs/models \
+  --width 0.25 --image-size 128 --batch-size 4 --epochs 2 --accel
 ```
 
-There are several command line arguments, the important ones are listed below
+`--accel` selects CUDA. The first training run downloads pretrained VGG16 weights
+unless they are already cached. Two epochs are a starting point, not a quality guarantee.
+Checkpoints include architecture metadata and BN statistics, but no optimizer resume state.
+Old InstanceNorm checkpoints and downloaded original pretrained models are incompatible.
 
-- `--dataset`: path to training dataset, the path should point to a folder containing another folder with all the training images. I used COCO 2014 Training images dataset [80K/13GB] [(download)](https://cocodataset.org/#download).
-- `--style-image`: path to style-image.
-- `--save-model-dir`: path to folder where trained model will be saved.
-- `--accel`: use accelerator.
+## Evaluation And Conversion
 
-If `--accel` argument is given, pytorch will search for available hardware acceleration device and attempt to use it. This example is known to work on CUDA, MPS and XPU devices.
+```bash
+python neural_style/neural_style.py eval \
+  --model outputs/models/ti60_epoch_2_TIMESTAMP.model \
+  --content-image images/content-images/amber.jpg \
+  --output-image outputs/preview.png
+```
 
-Refer to `neural_style/neural_style.py` for other command line arguments. For training new models you might have to tune the values of `--content-weight` and `--style-weight`. The mosaic style model shown above was trained with `--content-weight 1e5` and `--style-weight 1e10`. The remaining 3 models were also trained with similar order of weight parameters with slight variation in the `--style-weight` (`5e10` or `1e11`).
+Use a separate conversion environment with `requirements-convert.txt`. Its version
+ranges are candidate constraints and have not been validated together locally.
 
-## Models
+```bash
+python -m pip install -r requirements-convert.txt
+python script/model2tf_lite.py \
+  --model outputs/models/ti60_epoch_2_TIMESTAMP.model \
+  --calib /data/calibration --calib-count 100 \
+  --onnx outputs/style.onnx --saved-model outputs/saved_model \
+  --int8-tflite outputs/style_int8.tflite
+```
 
-Models for the examples shown below can be downloaded from [here](https://www.dropbox.com/s/lrvwfehqdcxoza8/saved_models.zip?dl=0) or by running the script `download_saved_models.py`.
+Conversion checks numerical parity, exports static NHWC INT8 IO and writes a JSON
+operator/quantization report. Unexpected operators fail the audit. Exit zero means
+software checks passed, not hardware deployment proved. Hardware nearest-neighbor
+resize, boundary pixel conversion and driver integration are still required to keep
+RISC-V out of elementwise computation. Full-system resource use and timing require
+FPGA synthesis and place-and-route.
 
-<div align='center'>
-  <img src='images/content-images/amber.jpg' height="174px">		
-</div>
+## Validation
 
-<div align='center'>
-  <img src='images/style-images/mosaic.jpg' height="174px">
-  <img src='images/output-images/amber-mosaic.jpg' height="174px">
-  <img src='images/output-images/amber-candy.jpg' height="174px">
-  <img src='images/style-images/candy.jpg' height="174px">
-  <br>
-  <img src='images/style-images/rain-princess-cropped.jpg' height="174px">
-  <img src='images/output-images/amber-rain-princess.jpg' height="174px">
-  <img src='images/output-images/amber-udnie.jpg' height="174px">
-  <img src='images/style-images/udnie.jpg' height="174px">
-</div>
+From the repository root:
+
+```bash
+python -m unittest discover -s fast_neural_style -p test_ti60.py -v
+```
+
+Tests do not train or download weights. Model tests skip when PyTorch is unavailable.
+The current local environment lacks PyTorch and the conversion stack, so only the
+preprocessing/parity helper tests have run; full model and conversion validation
+must be performed in the server environment.
