@@ -16,6 +16,9 @@ import traceback
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+STRICT_PARITY_ATOL = 0.01
+STRICT_PARITY_RTOL = 0.0001
+
 
 def record_stage(report, stage):
     report["stage"] = stage
@@ -37,6 +40,9 @@ def parse_args():
     p.add_argument("--calib-count", type=int, default=100, help="Maximum calibration images (default: 100)")
     p.add_argument("--content", help="Verification image; defaults to first calibration image")
     p.add_argument("--output-image", help="Clipped verification PNG; defaults to <int8-tflite>.preview.png")
+    p.add_argument("--experimental-folding-atol", type=float,
+                   help="Experimental FP32 BN-folding absolute tolerance in raw RGB units; "
+                        "must exceed 0.01. Other checks stay strict; completion exits 3, not 0")
     args = p.parse_args()
     if (args.height is None) != (args.input_width is None):
         p.error("--height and --input-width must be supplied together")
@@ -49,6 +55,10 @@ def parse_args():
             p.error(str(error))
     if args.calib_count <= 0:
         p.error("--calib-count must be positive")
+    if args.experimental_folding_atol is not None and (
+            not math.isfinite(args.experimental_folding_atol) or
+            args.experimental_folding_atol <= STRICT_PARITY_ATOL):
+        p.error("--experimental-folding-atol must be finite and greater than 0.01")
     return args
 
 
@@ -137,17 +147,17 @@ def metrics(reference, actual):
             "rmse": math.sqrt(mse), "psnr_255_db": 10 * math.log10(255 ** 2 / mse) if mse else None}
 
 
-def parity_metrics(reference, actual):
+def parity_metrics(reference, actual, *, atol=STRICT_PARITY_ATOL):
     import numpy as np
 
     result = metrics(reference, actual)
-    result.update(atol=0.01, rtol=0.0001)
-    close = np.isclose(reference, actual, atol=0.01, rtol=0.0001)
+    result.update(atol=atol, rtol=STRICT_PARITY_RTOL)
+    close = np.isclose(reference, actual, atol=atol, rtol=STRICT_PARITY_RTOL)
     result["passed"] = bool(np.all(close))
     result["failed_elements"] = int(np.count_nonzero(~close))
     if not result["passed"]:
         delta = np.abs(reference.astype(np.float64) - actual.astype(np.float64))
-        allowed = 0.01 + 0.0001 * np.abs(actual.astype(np.float64))
+        allowed = atol + STRICT_PARITY_RTOL * np.abs(actual.astype(np.float64))
         ratios = np.where(close, -1, delta / allowed)
         index = np.unravel_index(int(np.argmax(ratios)), ratios.shape)
         result["worst_failure"] = {
@@ -228,6 +238,80 @@ def diagnose_bn_folding(net, fused, inputs, reference, actual):
         "scope": "Read-only diagnostics for the failing probe. No weights, tolerances or conversion gates are changed.",
         "layer_note": "Layer outputs include upstream errors; first_failed_layer is localization, not proof of a faulty layer.",
     }
+
+
+def check_folding_parity(net, fused, probes, report, experimental_atol=None):
+    """Return original FP32 fused outputs; experimental budgets never replace strict results."""
+    import torch
+
+    references = []
+    experiment = None
+    if experimental_atol is not None:
+        if not math.isfinite(experimental_atol) or experimental_atol <= STRICT_PARITY_ATOL:
+            raise ValueError("Experimental folding tolerance must be finite and greater than 0.01")
+        experiment = report["folding_experiment"] = {
+            "atol": experimental_atol, "rtol": STRICT_PARITY_RTOL, "passed": False,
+            "strict_failures": [], "failures": [], "probes": [],
+            "scope": "Experimental FP32 folding budget in unclipped RGB units only. "
+                     "Strict FP32 results remain in parity; FP64 equivalence and downstream gates stay strict. "
+                     "Export weights are unchanged; artifacts are not strict-acceptance candidates.",
+        }
+        print(f"[experimental] folding atol={experimental_atol}, rtol={STRICT_PARITY_RTOL}; "
+              "strict results are retained; completed conversion exits 3", file=sys.stderr, flush=True)
+    with torch.inference_mode():
+        if experiment is not None:
+            reference64_net = copy.deepcopy(net).double()
+            fused64 = reference64_net.fused()
+        for index, probe in enumerate(probes):
+            inputs = torch.from_numpy(probe)
+            reference = net(inputs).numpy()
+            actual = fused(inputs).numpy()
+            if actual.shape != probe.shape:
+                raise ValueError(f"Model output must preserve RGB image shape, got {actual.shape}")
+            name = f"pytorch_unfused_vs_fused_{index}"
+            strict = report["parity"][name] = parity_metrics(reference, actual)
+            if experiment is not None:
+                if not strict["passed"]:
+                    experiment["strict_failures"].append(name)
+                budget = parity_metrics(reference, actual, atol=experimental_atol)
+                inputs64 = inputs.double()
+                equivalence = parity_metrics(reference64_net(inputs64).numpy(), fused64(inputs64).numpy())
+                experiment["probes"].append({
+                    "probe_index": index, "strict_parity_key": name,
+                    "fp32_budget": budget, "fp64_equivalence": equivalence,
+                })
+                if not budget["passed"]:
+                    experiment["failures"].append(f"{name}: experimental FP32 folding budget exceeded")
+                if not equivalence["passed"]:
+                    experiment["failures"].append(f"{name}: strict FP64 folding equivalence failed")
+                print(f"[experimental] probe={index} strict={strict['passed']} "
+                      f"fp32_budget={budget['passed']} fp64_equivalence={equivalence['passed']}",
+                      file=sys.stderr, flush=True)
+            elif not strict["passed"]:
+                try:
+                    diagnostics = diagnose_bn_folding(net, fused, inputs, reference, actual)
+                    diagnostics["probe_index"] = index
+                    report["folding_diagnostics"] = diagnostics
+                    for comparison_name, comparison in diagnostics["comparisons"].items():
+                        print(f"[folding] {comparison_name}: passed={comparison['passed']} "
+                              f"max_abs={comparison['max_abs']:.8g} failed_elements={comparison['failed_elements']}",
+                              file=sys.stderr, flush=True)
+                    print(f"[folding] first_failed_layer={diagnostics['first_failed_layer']}",
+                          file=sys.stderr, flush=True)
+                except Exception as diagnostic_error:
+                    report["folding_diagnostics"] = {
+                        "probe_index": index, "error": f"{type(diagnostic_error).__name__}: {diagnostic_error}",
+                        "traceback": traceback.format_exc(),
+                    }
+                raise ValueError(f"{name} parity failed: {strict}")
+            references.append(actual)
+    if experiment is not None:
+        experiment["strict_folding_passed"] = not experiment["strict_failures"]
+        experiment["passed"] = bool(probes) and not experiment["failures"]
+        if not experiment["passed"]:
+            raise ValueError("Experimental folding checks failed: " +
+                             "; ".join(experiment["failures"] or ["No input probes"]))
+    return references
 
 
 def signature_layout(spec, size):
@@ -579,34 +663,9 @@ def convert(a, report):
     probes = [image.transpose(0, 3, 1, 2).copy(),
                rng.uniform(0, 255, (1, 3, height, image_width)).astype(np.float32),
                np.zeros((1, 3, height, image_width), dtype=np.float32)]
-    references = []
     record_stage(report, "pytorch_parity")
+    references = check_folding_parity(net, fused, probes, report, a.experimental_folding_atol)
     with torch.inference_mode():
-        for i, x in enumerate(probes):
-            ref = net(torch.from_numpy(x)).numpy()
-            out = fused(torch.from_numpy(x)).numpy()
-            if out.shape != x.shape:
-                raise ValueError(f"Model output must preserve RGB image shape, got {out.shape}")
-            try:
-                require_parity(ref, out, f"pytorch_unfused_vs_fused_{i}", report)
-            except ValueError:
-                try:
-                    diagnostics = diagnose_bn_folding(net, fused, torch.from_numpy(x), ref, out)
-                    diagnostics["probe_index"] = i
-                    report["folding_diagnostics"] = diagnostics
-                    for name, comparison in diagnostics["comparisons"].items():
-                        print(f"[folding] {name}: passed={comparison['passed']} "
-                              f"max_abs={comparison['max_abs']:.8g} failed_elements={comparison['failed_elements']}",
-                              file=sys.stderr, flush=True)
-                    print(f"[folding] first_failed_layer={diagnostics['first_failed_layer']}",
-                          file=sys.stderr, flush=True)
-                except Exception as diagnostic_error:
-                    report["folding_diagnostics"] = {
-                        "probe_index": i, "error": f"{type(diagnostic_error).__name__}: {diagnostic_error}",
-                        "traceback": traceback.format_exc(),
-                    }
-                raise
-            references.append(out)
         record_stage(report, "onnx_export")
         torch.onnx.export(fused, torch.from_numpy(probes[0]), a.onnx, opset_version=13,
                           dynamo=False, input_names=["input"], output_names=["output"],
@@ -714,6 +773,8 @@ def main():
         print("Output paths must be distinct and must not overwrite input images/checkpoints", file=sys.stderr)
         return 2
     report = {"status": "failed", "target": "Ti60", "blockers": [], "parity": {}, "artifacts": {},
+        "mode": "strict" if a.experimental_folding_atol is None else "experimental_folding",
+        "experimental_folding_atol": a.experimental_folding_atol,
         "target_contract": {"batch": 1, "io_layout": "NHWC", "io_dtype": "int8",
                              "convolution": "zero SAME, dilation 1; DW multiplier 1; stride 2 pads right/bottom",
                              "upsampling": "two nearest-neighbor 2x resizes",
@@ -732,8 +793,15 @@ def main():
         Path(a.saved_model).mkdir(parents=True, exist_ok=True)
         convert(a, report)
         if not report["blockers"]:
-            report["status"] = "software_checks_passed_hardware_unproven"
-            record_stage(report, "complete")
+            if a.experimental_folding_atol is None:
+                report["status"] = "software_checks_passed_hardware_unproven"
+                record_stage(report, "complete")
+            else:
+                experiment = report.get("folding_experiment", {})
+                if experiment.get("passed") is not True or len(experiment.get("probes", [])) != 3:
+                    raise ValueError("Experimental conversion requires three passing folding probes")
+                report["status"] = "experimental_conversion_completed_hardware_unproven"
+                record_stage(report, "experimental_complete")
     except Exception as exc:
         report["blockers"].append(f"{type(exc).__name__}: {exc}")
         report["traceback"] = traceback.format_exc()
@@ -744,7 +812,12 @@ def main():
     print(f"Report: {a.report}")
     for blocker in report["blockers"]:
         print(f"BLOCKER: {blocker}", file=sys.stderr)
-    return 1 if report["blockers"] else 0
+    if report["blockers"]:
+        return 1
+    if a.experimental_folding_atol is not None:
+        print("EXPERIMENTAL: conversion completed, not strict acceptance; exit code 3.", file=sys.stderr)
+        return 3
+    return 0
 
 
 if __name__ == "__main__":

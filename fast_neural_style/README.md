@@ -74,8 +74,8 @@ in the server environment; it was not run for this change.
 The environment variables select CPU execution and disable oneDNN optimizations
 for this conversion command and its children. A historical legacy-BN server run
 completed conversion with both settings after a GPU parity failure; this neither
-isolates the cause nor validates DW conversion. Keep trained weights and parity
-tolerances unchanged. See the Chinese guide for the server command, report
+isolates the cause nor validates DW conversion. Keep trained weights unchanged;
+strict parity tolerances remain the default. See the Chinese guide for the server command, report
 inspection, preview paths and explanations of common TensorFlow log messages.
 
 Conversion checks numerical parity, exports static NHWC INT8 IO and writes a JSON
@@ -98,6 +98,29 @@ Benchmark STANDARD 4x2/8x2. Historical original 128x128 Rain at vendor 8x2, 100 
 took 354.55 ms Invoke (about 0.453 GMAC/s effective convolution throughput); this
 does not predict DW performance. Historical 16x4 used 75,945 XLR and 281 RAM,
 exceeding Ti60 capacity. See the deployment guide for quantization and padding rules.
+
+## Experimental Folding Budget
+
+Only for investigating later conversion stages, explicitly add
+`--experimental-folding-atol 0.1` to the existing server command and use separate
+experimental output paths. This is an example budget, not a validated accuracy
+threshold. The value must be finite and greater than 0.01, in unclipped RGB output
+units; relative tolerance remains 0.0001. No checkpoint or export weights change.
+
+All three probes (content image, deterministic random input, zeros) retain their
+original strict FP32 results in `parity`. Each also must pass the experimental
+FP32 budget and a separate FP64 folding equivalence check using the original
+strict tolerances. Budget/equivalence failures are collected across the probes
+and block ONNX export; invalid shapes or non-finite results still abort immediately.
+ONNX/SavedModel parity, INT8 conversion and graph audit are not relaxed.
+
+Review `folding_experiment.probes` and `folding_experiment.strict_failures`.
+Completed experiments always have status
+`experimental_conversion_completed_hardware_unproven` and **exit code 3**, even
+if their original strict folding checks also pass. They are not strict acceptance
+or hardware proof. Failures still exit 1; invalid arguments exit 2. Without the
+option, strict completion still exits 0. Check more content images before choosing
+any acceptance budget; calibration images are not a multi-image parity test.
 
 ## Validation
 

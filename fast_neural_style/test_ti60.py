@@ -24,13 +24,14 @@ HAS_TORCH = importlib.util.find_spec("torch") is not None
 
 
 class ConversionDiagnosticsTests(unittest.TestCase):
-    def run_conversion(self, conversion):
+    def run_conversion(self, conversion, extra_args=()):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             output = root / "style_int8.tflite"
             arguments = ["model2tf_lite.py", "--model", str(root / "model.model"),
                          "--calib", str(root / "calib"), "--onnx", str(root / "style.onnx"),
                          "--saved-model", str(root / "saved_model"), "--int8-tflite", str(output)]
+            arguments.extend(extra_args)
             stdout, stderr = io.StringIO(), io.StringIO()
             with (mock.patch.object(sys, "argv", arguments),
                   mock.patch.object(converter, "convert", side_effect=conversion),
@@ -85,8 +86,78 @@ class ConversionDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("[stage] complete", stderr)
         self.assertIn("Report:", stdout)
 
+    def test_experimental_completion_is_never_strict_success(self):
+        for strict_passed in (False, True):
+            with self.subTest(strict_passed=strict_passed):
+                def complete_experiment(args, report):
+                    report["folding_experiment"] = {
+                        "passed": True, "strict_folding_passed": strict_passed,
+                        "probes": [{"probe_index": index} for index in range(3)],
+                    }
+
+                exit_code, report, stdout, stderr = self.run_conversion(
+                    complete_experiment, ("--experimental-folding-atol", "0.1"))
+                self.assertEqual(exit_code, 3)
+                self.assertEqual(report["status"], "experimental_conversion_completed_hardware_unproven")
+                self.assertEqual(report["stage"], "experimental_complete")
+                self.assertEqual(report["mode"], "experimental_folding")
+                self.assertEqual(report["experimental_folding_atol"], 0.1)
+                self.assertEqual(report["blockers"], [])
+                self.assertFalse(report["hardware_proven"])
+                self.assertIn("not strict acceptance", stderr)
+
+    def test_experimental_completion_requires_all_folding_probes(self):
+        for count in (0, 1, 2):
+            with self.subTest(count=count):
+                def incomplete_experiment(args, report):
+                    report["folding_experiment"] = {"passed": True, "probes": [{}] * count}
+
+                exit_code, report, stdout, stderr = self.run_conversion(
+                    incomplete_experiment, ("--experimental-folding-atol", "0.1"))
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(report["status"], "failed")
+                self.assertIn("three passing folding probes", report["blockers"][0])
+
+    def test_experimental_option_does_not_relax_downstream_parity(self):
+        for name in ("pytorch_fused_vs_onnx_0", "pytorch_fused_vs_saved_model_0"):
+            with self.subTest(name=name):
+                def fail_parity(args, report):
+                    require_parity(np.array([0.0]), np.array([0.05]), name, report)
+
+                exit_code, report, stdout, stderr = self.run_conversion(
+                    fail_parity, ("--experimental-folding-atol", "0.1"))
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(report["status"], "failed")
+                self.assertFalse(report["parity"][name]["passed"])
+                self.assertEqual(report["parity"][name]["atol"], 0.01)
+
+    def test_experimental_audit_blocker_still_fails(self):
+        def reject_graph(args, report):
+            converter.record_stage(report, "tflite_audit")
+            report["blockers"].append("Unsupported operator")
+
+        exit_code, report, stdout, stderr = self.run_conversion(
+            reject_graph, ("--experimental-folding-atol", "0.1"))
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["stage"], "tflite_audit")
+        self.assertFalse(report["hardware_proven"])
+
 
 class ConversionTests(unittest.TestCase):
+    def test_experimental_folding_cli_requires_explicit_finite_budget(self):
+        arguments = ["model2tf_lite.py", "--model", "checkpoint.model"]
+        with mock.patch.object(sys, "argv", arguments):
+            self.assertIsNone(converter.parse_args().experimental_folding_atol)
+        with mock.patch.object(sys, "argv", arguments + ["--experimental-folding-atol", "0.1"]):
+            self.assertEqual(converter.parse_args().experimental_folding_atol, 0.1)
+        for value in ("nan", "inf", "-inf", "-1", "0", "0.009", "0.01"):
+            with (self.subTest(value=value),
+                  mock.patch.object(sys, "argv", arguments + [f"--experimental-folding-atol={value}"]),
+                  contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error):
+                converter.parse_args()
+            self.assertEqual(error.exception.code, 2)
+
     def test_preprocess_center_crop_preserves_rgb_range(self):
         image = np.zeros((16, 32, 3), dtype=np.uint8)
         image[:, 8:24] = [12, 128, 255]
@@ -189,6 +260,19 @@ class ConversionTests(unittest.TestCase):
                 self.assertEqual(result["failed_elements"], int(np.count_nonzero(
                     ~np.isclose(reference, actual, atol=0.01, rtol=0.0001))))
         self.assertNotIn("worst_failure", parity_metrics(reference, reference))
+
+    def test_explicit_parity_budget_does_not_change_strict_defaults(self):
+        reference, actual = np.array([0.0]), np.array([0.05])
+        relaxed = parity_metrics(reference, actual, atol=0.1)
+        self.assertTrue(relaxed["passed"])
+        self.assertEqual(relaxed["atol"], 0.1)
+        self.assertEqual(relaxed["rtol"], 0.0001)
+        failed = parity_metrics(reference, np.array([0.2]), atol=0.1)
+        self.assertFalse(failed["passed"])
+        self.assertAlmostEqual(failed["worst_failure"]["allowed_error"], 0.10002)
+        self.assertFalse(parity_metrics(reference, actual)["passed"])
+        with self.assertRaisesRegex(ValueError, "parity failed"):
+            require_parity(reference, actual, "unchanged", {"parity": {}})
 
 
 class GraphValidationTests(unittest.TestCase):
@@ -294,7 +378,129 @@ class GraphValidationTests(unittest.TestCase):
 
 
 @unittest.skipUnless(HAS_TORCH, "PyTorch is not installed")
+class FoldingExperimentTests(unittest.TestCase):
+    def models_and_probes(self, fp32_shift=0.05, fp64_shift=0.0):
+        """Controlled shifts exercise each gate without training or conversion dependencies."""
+        import torch
+
+        class ProbeModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.folded = False
+                self.register_buffer("offsets", torch.tensor([fp32_shift, fp64_shift]))
+
+            def forward(self, inputs):
+                if self.folded:
+                    return inputs + self.offsets[0 if inputs.dtype == torch.float32 else 1]
+                return inputs.clone()
+
+            def fused(self):
+                model = copy.deepcopy(self).eval()
+                model.folded = True
+                return model
+
+        net = ProbeModel().eval()
+        probes = [np.full((1, 3, 16, 20), value, dtype=np.float32) for value in (200, 0.5, 0)]
+        return net, net.fused(), probes
+
+    def test_default_success_has_no_experimental_budget(self):
+        net, fused, probes = self.models_and_probes(fp32_shift=0.0)
+        report = {"parity": {}}
+        references = converter.check_folding_parity(net, fused, probes, report)
+        self.assertEqual(len(references), 3)
+        self.assertTrue(all(result["passed"] for result in report["parity"].values()))
+        self.assertNotIn("folding_experiment", report)
+
+    def test_default_still_blocks_and_collects_folding_diagnostics(self):
+        net, fused, probes = self.models_and_probes()
+        report = {"parity": {}}
+        with (mock.patch.object(converter, "diagnose_bn_folding",
+                                return_value={"comparisons": {}, "first_failed_layer": None}) as diagnose,
+              self.assertRaisesRegex(ValueError, "pytorch_unfused_vs_fused_0 parity failed")):
+            converter.check_folding_parity(net, fused, probes, report)
+        diagnose.assert_called_once()
+        self.assertFalse(report["parity"]["pytorch_unfused_vs_fused_0"]["passed"])
+        self.assertEqual(report["folding_diagnostics"]["probe_index"], 0)
+        self.assertNotIn("folding_experiment", report)
+
+    def test_experiment_retains_strict_failures_and_original_fp32_outputs(self):
+        net, fused, probes = self.models_and_probes()
+        report = {"parity": {}}
+        references = converter.check_folding_parity(net, fused, probes, report, 0.1)
+        experiment = report["folding_experiment"]
+        self.assertTrue(experiment["passed"])
+        self.assertFalse(experiment["strict_folding_passed"])
+        self.assertEqual(experiment["strict_failures"], list(report["parity"]))
+        self.assertEqual(len(references), 3)
+        self.assertEqual(len(experiment["probes"]), 3)
+        for index, entry in enumerate(experiment["probes"]):
+            strict = report["parity"][entry["strict_parity_key"]]
+            self.assertFalse(strict["passed"])
+            self.assertEqual(strict["atol"], 0.01)
+            self.assertTrue(entry["fp32_budget"]["passed"])
+            self.assertEqual(entry["fp32_budget"]["atol"], 0.1)
+            self.assertTrue(entry["fp64_equivalence"]["passed"])
+            self.assertEqual(entry["fp64_equivalence"]["atol"], 0.01)
+            np.testing.assert_array_equal(references[index], probes[index] + np.float32(0.05))
+            self.assertEqual(references[index].dtype, np.float32)
+        json.dumps(report, allow_nan=False)
+
+    def test_later_probe_budget_failures_block_after_checking_all_probes(self):
+        net, fused, probes = self.models_and_probes()
+        report = {"parity": {}}
+        with self.assertRaisesRegex(ValueError, "experimental FP32 folding budget exceeded"):
+            converter.check_folding_parity(net, fused, probes, report, 0.04)
+        experiment = report["folding_experiment"]
+        self.assertFalse(experiment["passed"])
+        self.assertEqual(len(experiment["probes"]), 3)
+        self.assertEqual([entry["fp32_budget"]["passed"] for entry in experiment["probes"]],
+                         [True, False, False])
+        self.assertEqual(len(experiment["failures"]), 2)
+
+    def test_fp64_failure_blocks_even_when_experimental_fp32_budget_passes(self):
+        net, fused, probes = self.models_and_probes(fp64_shift=0.05)
+        report = {"parity": {}}
+        with self.assertRaisesRegex(ValueError, "strict FP64 folding equivalence failed"):
+            converter.check_folding_parity(net, fused, probes, report, 0.1)
+        experiment = report["folding_experiment"]
+        self.assertFalse(experiment["passed"])
+        self.assertEqual(len(experiment["probes"]), 3)
+        self.assertTrue(all(entry["fp32_budget"]["passed"] for entry in experiment["probes"]))
+        self.assertTrue(all(not entry["fp64_equivalence"]["passed"] for entry in experiment["probes"]))
+
+    def test_experiment_does_not_accept_nonfinite_outputs(self):
+        net, fused, probes = self.models_and_probes(fp32_shift=float("nan"))
+        report = {"parity": {}}
+        with self.assertRaisesRegex(ValueError, "Non-finite"):
+            converter.check_folding_parity(net, fused, probes, report, 0.1)
+        self.assertFalse(report["folding_experiment"]["passed"])
+
+
+@unittest.skipUnless(HAS_TORCH, "PyTorch is not installed")
 class ModelTests(unittest.TestCase):
+    def test_experimental_folding_preserves_model_weights_dtypes_and_outputs(self):
+        import torch
+        from neural_style.transformer_net import DWTransformerNet
+
+        torch.set_num_threads(1)
+        torch.manual_seed(12)
+        net = DWTransformerNet().eval()
+        fused = net.fused()
+        states = [{name: value.clone() for name, value in model.state_dict().items()}
+                  for model in (net, fused)]
+        probes = [np.full((1, 3, 16, 20), value, dtype=np.float32) for value in (200, 0.5, 0)]
+        report = {"parity": {}}
+        references = converter.check_folding_parity(net, fused, probes, report, 0.1)
+        self.assertTrue(report["folding_experiment"]["passed"])
+        with torch.inference_mode():
+            for probe, reference in zip(probes, references):
+                np.testing.assert_array_equal(reference, fused(torch.from_numpy(probe)).numpy())
+        for model, state in zip((net, fused), states):
+            for name, value in model.state_dict().items():
+                torch.testing.assert_close(value, state[name], atol=0, rtol=0)
+            self.assertIs(next(model.parameters()).dtype, torch.float32)
+            self.assertFalse(model.training)
+
     def test_folding_diagnostics_preserve_models_and_remove_hooks(self):
         import torch
         from neural_style.transformer_net import DWTransformerNet
