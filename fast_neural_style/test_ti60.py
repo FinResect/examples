@@ -122,7 +122,7 @@ class ConversionDiagnosticsTests(unittest.TestCase):
         for name in ("pytorch_fused_vs_onnx_0", "pytorch_fused_vs_saved_model_0"):
             with self.subTest(name=name):
                 def fail_parity(args, report):
-                    require_parity(np.array([0.0]), np.array([0.05]), name, report)
+                    converter.require_export_parity(np.array([0.0]), np.array([0.05]), name, report)
 
                 exit_code, report, stdout, stderr = self.run_conversion(
                     fail_parity, ("--experimental-folding-atol", "0.1"))
@@ -131,20 +131,54 @@ class ConversionDiagnosticsTests(unittest.TestCase):
                 self.assertFalse(report["parity"][name]["passed"])
                 self.assertEqual(report["parity"][name]["atol"], 0.01)
 
+    def test_fp64_reference_completion_requires_validation_and_remains_experimental(self):
+        for validated, count in ((False, 3), (True, 2), (True, 3)):
+            with self.subTest(validated=validated, count=count):
+                def complete_experiment(args, report):
+                    report["folding_experiment"] = {"passed": True, "probes": [{}] * 3}
+                    report["fp64_reference"] = {"validated": validated, "probes": [{}] * count}
+
+                exit_code, report, stdout, stderr = self.run_conversion(
+                    complete_experiment, ("--experimental-folding-atol", "0.1",
+                                          "--experimental-fused-fp64-reference"))
+                self.assertEqual(report["mode"], "experimental_fused_fp64_reference")
+                self.assertTrue(report["experimental_fused_fp64_reference"])
+                self.assertFalse(report["hardware_proven"])
+                if validated and count == 3:
+                    self.assertEqual(exit_code, 3)
+                    self.assertEqual(report["status"], "experimental_conversion_completed_hardware_unproven")
+                else:
+                    self.assertEqual(exit_code, 1)
+                    self.assertEqual(report["status"], "failed")
+
     def test_experimental_audit_blocker_still_fails(self):
         def reject_graph(args, report):
             converter.record_stage(report, "tflite_audit")
             report["blockers"].append("Unsupported operator")
 
-        exit_code, report, stdout, stderr = self.run_conversion(
-            reject_graph, ("--experimental-folding-atol", "0.1"))
-        self.assertEqual(exit_code, 1)
-        self.assertEqual(report["status"], "failed")
-        self.assertEqual(report["stage"], "tflite_audit")
-        self.assertFalse(report["hardware_proven"])
+        for reference_args in ((), ("--experimental-fused-fp64-reference",)):
+            with self.subTest(reference_args=reference_args):
+                exit_code, report, stdout, stderr = self.run_conversion(
+                    reject_graph, ("--experimental-folding-atol", "0.1") + reference_args)
+                self.assertEqual(exit_code, 1)
+                self.assertEqual(report["status"], "failed")
+                self.assertEqual(report["stage"], "tflite_audit")
+                self.assertFalse(report["hardware_proven"])
 
 
 class ConversionTests(unittest.TestCase):
+    def test_fp64_reference_cli_requires_explicit_experimental_folding(self):
+        arguments = ["model2tf_lite.py", "--model", "checkpoint.model"]
+        with mock.patch.object(sys, "argv", arguments):
+            self.assertFalse(converter.parse_args().experimental_fused_fp64_reference)
+        with (mock.patch.object(sys, "argv", arguments + ["--experimental-fused-fp64-reference"]),
+              contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error):
+            converter.parse_args()
+        self.assertEqual(error.exception.code, 2)
+        with mock.patch.object(sys, "argv", arguments + ["--experimental-folding-atol", "0.1",
+                                                       "--experimental-fused-fp64-reference"]):
+            self.assertTrue(converter.parse_args().experimental_fused_fp64_reference)
+
     def test_experimental_folding_cli_requires_explicit_finite_budget(self):
         arguments = ["model2tf_lite.py", "--model", "checkpoint.model"]
         with mock.patch.object(sys, "argv", arguments):
@@ -273,6 +307,60 @@ class ConversionTests(unittest.TestCase):
         self.assertFalse(parity_metrics(reference, actual)["passed"])
         with self.assertRaisesRegex(ValueError, "parity failed"):
             require_parity(reference, actual, "unchanged", {"parity": {}})
+
+
+class ExportReferenceTests(unittest.TestCase):
+    def reference_report(self):
+        return {"parity": {}, "fp64_reference": {
+            "validated": True, "probes": [{}] * 3, "parity": {}, "strict_fp32_failures": [],
+        }}
+
+    def test_default_export_gate_remains_strict(self):
+        report = {"parity": {}}
+        with self.assertRaisesRegex(ValueError, "parity failed"):
+            converter.require_export_parity(np.array([0.05]), np.array([0.005]), "onnx", report)
+        self.assertFalse(report["parity"]["onnx"]["passed"])
+        self.assertNotIn("fp64_reference", report)
+
+    def test_reference_gate_retains_fp32_failure_with_unchanged_tolerances(self):
+        for name in ("pytorch_fused_vs_onnx_0", "pytorch_fused_vs_saved_model_0"):
+            with self.subTest(name=name):
+                report = self.reference_report()
+                converter.require_export_parity(np.array([0.05], dtype=np.float32),
+                                                np.array([0.005], dtype=np.float32), name, report,
+                                                np.array([0.0], dtype=np.float64))
+                self.assertFalse(report["parity"][name]["passed"])
+                self.assertEqual(report["fp64_reference"]["strict_fp32_failures"], [name])
+                result = report["fp64_reference"]["parity"][name]
+                self.assertTrue(result["passed"])
+                self.assertEqual((result["atol"], result["rtol"]), (0.01, 0.0001))
+                self.assertEqual(result["reference_at_fp32_worst_failure"], 0.0)
+                json.dumps(report, allow_nan=False)
+
+    def test_reference_failure_blocks_even_when_fp32_comparison_passes(self):
+        report = self.reference_report()
+        with self.assertRaisesRegex(ValueError, "FP64-reference parity failed"):
+            converter.require_export_parity(np.array([0.0]), np.array([0.0]), "onnx", report,
+                                            np.array([1.0]))
+        self.assertTrue(report["parity"]["onnx"]["passed"])
+        self.assertFalse(report["fp64_reference"]["parity"]["onnx"]["passed"])
+
+    def test_reference_must_be_validated_on_all_three_probes(self):
+        for validated, count in ((False, 3), (True, 1), (True, 2)):
+            with self.subTest(validated=validated, count=count):
+                report = self.reference_report()
+                report["fp64_reference"].update(validated=validated, probes=[{}] * count)
+                with self.assertRaisesRegex(ValueError, "validated three-probe"):
+                    converter.require_export_parity(np.array([0.0]), np.array([0.0]), "onnx", report,
+                                                    np.array([0.0]))
+
+    def test_reference_policy_does_not_accept_nonfinite_or_mismatched_results(self):
+        for actual, reference64 in ((np.array([np.nan]), np.array([0.0])),
+                                    (np.array([0.0]), np.array([np.inf])),
+                                    (np.array([0.0, 0.0]), np.array([0.0]))):
+            with self.subTest(actual=actual, reference64=reference64), self.assertRaises(ValueError):
+                converter.require_export_parity(np.array([0.0]), actual, "onnx", self.reference_report(),
+                                                reference64)
 
 
 class GraphValidationTests(unittest.TestCase):
@@ -478,6 +566,52 @@ class FoldingExperimentTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_TORCH, "PyTorch is not installed")
 class ModelTests(unittest.TestCase):
+    def test_fp64_reference_upcasts_export_weights_without_refusion_or_mutation(self):
+        import torch
+        from neural_style.transformer_net import DWTransformerNet
+
+        torch.set_num_threads(1)
+        torch.manual_seed(12)
+        net = DWTransformerNet().eval()
+        fused = net.fused()
+        states = [{name: value.clone() for name, value in model.state_dict().items()}
+                  for model in (net, fused)]
+        probes = [np.full((1, 3, 16, 20), value, dtype=np.float32) for value in (200, 0.5, 0)]
+        report = {"parity": {}}
+        with mock.patch.object(fused, "fused", side_effect=AssertionError("Do not re-fuse export weights")):
+            references = converter.build_fused_fp64_references(net, fused, probes, report)
+        self.assertTrue(report["fp64_reference"]["validated"])
+        self.assertEqual(len(report["fp64_reference"]["probes"]), 3)
+        with torch.inference_mode():
+            expected_model = copy.deepcopy(fused).double()
+            for probe, reference in zip(probes, references):
+                self.assertEqual(reference.dtype, np.float64)
+                np.testing.assert_array_equal(reference, expected_model(torch.from_numpy(probe).double()).numpy())
+        for model, state in zip((net, fused), states):
+            for name, value in model.state_dict().items():
+                torch.testing.assert_close(value, state[name], atol=0, rtol=0)
+            self.assertIs(next(model.parameters()).dtype, torch.float32)
+            self.assertFalse(model.training)
+        json.dumps(report, allow_nan=False)
+
+    def test_fp64_reference_rejects_export_parameter_drift_on_all_probes(self):
+        import torch
+
+        net = torch.nn.Identity().eval()
+        fused = torch.nn.Conv2d(3, 3, 1, groups=3).eval()
+        with torch.no_grad():
+            fused.weight.fill_(1)
+            fused.bias.fill_(0.05)
+        probes = [np.full((1, 3, 16, 20), value, dtype=np.float32) for value in (200, 0.5, 0)]
+        report = {"parity": {}, "folding_experiment": {"atol": 0.1, "passed": True}}
+        with self.assertRaisesRegex(ValueError, "FP32 export parameters fail strict FP64 equivalence"):
+            converter.build_fused_fp64_references(net, fused, probes, report)
+        details = report["fp64_reference"]
+        self.assertFalse(details["validated"])
+        self.assertEqual(len(details["probes"]), 3)
+        self.assertEqual(len(details["failures"]), 3)
+        self.assertTrue(all(entry["unfused_vs_exported_weights"]["atol"] == 0.01 for entry in details["probes"]))
+
     def test_experimental_folding_preserves_model_weights_dtypes_and_outputs(self):
         import torch
         from neural_style.transformer_net import DWTransformerNet

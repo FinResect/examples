@@ -43,6 +43,9 @@ def parse_args():
     p.add_argument("--experimental-folding-atol", type=float,
                    help="Experimental FP32 BN-folding absolute tolerance in raw RGB units; "
                         "must exceed 0.01. Other checks stay strict; completion exits 3, not 0")
+    p.add_argument("--experimental-fused-fp64-reference", action="store_true",
+                   help="Experimental ONNX/SavedModel reference from the exported FP32 weights "
+                        "evaluated in FP64, with unchanged strict tolerances; requires a folding budget")
     args = p.parse_args()
     if (args.height is None) != (args.input_width is None):
         p.error("--height and --input-width must be supplied together")
@@ -59,6 +62,8 @@ def parse_args():
             not math.isfinite(args.experimental_folding_atol) or
             args.experimental_folding_atol <= STRICT_PARITY_ATOL):
         p.error("--experimental-folding-atol must be finite and greater than 0.01")
+    if args.experimental_fused_fp64_reference and args.experimental_folding_atol is None:
+        p.error("--experimental-fused-fp64-reference requires --experimental-folding-atol")
     return args
 
 
@@ -253,7 +258,7 @@ def check_folding_parity(net, fused, probes, report, experimental_atol=None):
             "atol": experimental_atol, "rtol": STRICT_PARITY_RTOL, "passed": False,
             "strict_failures": [], "failures": [], "probes": [],
             "scope": "Experimental FP32 folding budget in unclipped RGB units only. "
-                     "Strict FP32 results remain in parity; FP64 equivalence and downstream gates stay strict. "
+                     "Strict FP32 results remain in parity; FP64 equivalence and downstream tolerances stay strict. "
                      "Export weights are unchanged; artifacts are not strict-acceptance candidates.",
         }
         print(f"[experimental] folding atol={experimental_atol}, rtol={STRICT_PARITY_RTOL}; "
@@ -312,6 +317,64 @@ def check_folding_parity(net, fused, probes, report, experimental_atol=None):
             raise ValueError("Experimental folding checks failed: " +
                              "; ".join(experiment["failures"] or ["No input probes"]))
     return references
+
+
+def build_fused_fp64_references(net, fused, probes, report):
+    """Evaluate copies of the actual FP32 export parameters in FP64, without re-fusing."""
+    import torch
+
+    details = report["fp64_reference"] = {
+        "source": "exported_fp32_parameters_evaluated_in_fp64",
+        "validated": False, "probes": [], "failures": [], "parity": {}, "strict_fp32_failures": [],
+        "scope": "Explicit experimental reference policy, not original FP32 acceptance. "
+                 "Export parameters are only upcast on a copy, never re-fused or changed. "
+                 "Parameter equivalence and downstream FP64-reference comparisons use strict tolerances.",
+    }
+    references = []
+    with torch.inference_mode():
+        original64 = copy.deepcopy(net).double()
+        exported64 = copy.deepcopy(fused).double()
+        for index, probe in enumerate(probes):
+            inputs = torch.from_numpy(probe).double()
+            reference = original64(inputs).numpy()
+            actual = exported64(inputs).numpy()
+            if actual.shape != probe.shape:
+                raise ValueError(f"FP64 reference must preserve RGB image shape, got {actual.shape}")
+            result = parity_metrics(reference, actual)
+            details["probes"].append({"probe_index": index, "unfused_vs_exported_weights": result})
+            if not result["passed"]:
+                details["failures"].append(f"probe {index}: FP32 export parameters fail strict FP64 equivalence")
+            print(f"[reference] probe={index} export_parameters={result['passed']} "
+                  f"max_abs={result['max_abs']:.8g} failed_elements={result['failed_elements']}",
+                  file=sys.stderr, flush=True)
+            references.append(actual)
+    if len(probes) != 3:
+        details["failures"].append("FP64 reference requires all three input probes")
+    details["validated"] = not details["failures"]
+    if not details["validated"]:
+        raise ValueError("FP64 reference validation failed: " + "; ".join(details["failures"]))
+    return references
+
+
+def require_export_parity(reference, actual, name, report, fp64_reference=None):
+    if fp64_reference is None:
+        require_parity(reference, actual, name, report)
+        return
+    details = report.get("fp64_reference", {})
+    if details.get("validated") is not True or len(details.get("probes", [])) != 3:
+        raise ValueError("A validated three-probe FP64 reference is required")
+    original = report["parity"][name] = parity_metrics(reference, actual)
+    if not original["passed"]:
+        details["strict_fp32_failures"].append(name)
+    result = details["parity"][name] = parity_metrics(fp64_reference, actual)
+    if not original["passed"]:
+        index = tuple(original["worst_failure"]["index"])
+        result["reference_at_fp32_worst_failure"] = float(fp64_reference[index])
+    print(f"[reference] {name}: fp32={original['passed']} fp64_reference={result['passed']} "
+          f"max_abs={result['max_abs']:.8g} failed_elements={result['failed_elements']}",
+          file=sys.stderr, flush=True)
+    if not result["passed"]:
+        raise ValueError(f"{name} FP64-reference parity failed: {result}")
 
 
 def signature_layout(spec, size):
@@ -665,6 +728,10 @@ def convert(a, report):
                np.zeros((1, 3, height, image_width), dtype=np.float32)]
     record_stage(report, "pytorch_parity")
     references = check_folding_parity(net, fused, probes, report, a.experimental_folding_atol)
+    fp64_references = None
+    if a.experimental_fused_fp64_reference:
+        record_stage(report, "fp64_reference_validation")
+        fp64_references = build_fused_fp64_references(net, fused, probes, report)
     with torch.inference_mode():
         record_stage(report, "onnx_export")
         torch.onnx.export(fused, torch.from_numpy(probes[0]), a.onnx, opset_version=13,
@@ -678,7 +745,8 @@ def convert(a, report):
     session = ort.InferenceSession(str(a.onnx), providers=["CPUExecutionProvider"])
     for i, x in enumerate(probes):
         out = session.run(None, {session.get_inputs()[0].name: x})[0]
-        require_parity(references[i], out, f"pytorch_fused_vs_onnx_{i}", report)
+        require_export_parity(references[i], out, f"pytorch_fused_vs_onnx_{i}", report,
+                              fp64_references[i] if fp64_references is not None else None)
     report["artifacts"]["onnx"] = str(Path(a.onnx).resolve())
     record_stage(report, "onnx_to_saved_model")
     saved = Path(tempfile.mkdtemp(prefix="run-", dir=a.saved_model))
@@ -704,7 +772,8 @@ def convert(a, report):
         out = signature(**{input_name: tf.convert_to_tensor(sx)})[output_name].numpy()
         if output_layout == "NHWC":
             out = out.transpose(0, 3, 1, 2)
-        require_parity(references[i], out, f"pytorch_fused_vs_saved_model_{i}", report)
+        require_export_parity(references[i], out, f"pytorch_fused_vs_saved_model_{i}", report,
+                              fp64_references[i] if fp64_references is not None else None)
 
     def representative_dataset():
         for path in files:
@@ -743,6 +812,7 @@ def convert(a, report):
     dequantized = (codes.astype(np.float32) - zp_out) * scale_out
     reference = references[0].transpose(0, 2, 3, 1)
     report["verification"] = {"image": str(Path(a.content or files[0]).resolve()),
+        "float_reference": "pytorch_fused_fp32",
         "float_vs_int8_unclipped": metrics(reference, dequantized),
         "float_vs_int8_clipped_0_255": metrics(np.clip(reference, 0, 255), np.clip(dequantized, 0, 255)),
         "input_clipped_fraction": float(np.mean((raw < -128) | (raw > 127))),
@@ -773,8 +843,10 @@ def main():
         print("Output paths must be distinct and must not overwrite input images/checkpoints", file=sys.stderr)
         return 2
     report = {"status": "failed", "target": "Ti60", "blockers": [], "parity": {}, "artifacts": {},
-        "mode": "strict" if a.experimental_folding_atol is None else "experimental_folding",
+        "mode": ("experimental_fused_fp64_reference" if a.experimental_fused_fp64_reference else
+                 "strict" if a.experimental_folding_atol is None else "experimental_folding"),
         "experimental_folding_atol": a.experimental_folding_atol,
+        "experimental_fused_fp64_reference": a.experimental_fused_fp64_reference,
         "target_contract": {"batch": 1, "io_layout": "NHWC", "io_dtype": "int8",
                              "convolution": "zero SAME, dilation 1; DW multiplier 1; stride 2 pads right/bottom",
                              "upsampling": "two nearest-neighbor 2x resizes",
@@ -800,6 +872,10 @@ def main():
                 experiment = report.get("folding_experiment", {})
                 if experiment.get("passed") is not True or len(experiment.get("probes", [])) != 3:
                     raise ValueError("Experimental conversion requires three passing folding probes")
+                if a.experimental_fused_fp64_reference:
+                    reference = report.get("fp64_reference", {})
+                    if reference.get("validated") is not True or len(reference.get("probes", [])) != 3:
+                        raise ValueError("Experimental conversion requires a validated three-probe FP64 reference")
                 report["status"] = "experimental_conversion_completed_hardware_unproven"
                 record_stage(report, "experimental_complete")
     except Exception as exc:
