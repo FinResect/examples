@@ -11,8 +11,14 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import traceback
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+
+def record_stage(report, stage):
+    report["stage"] = stage
+    print(f"[stage] {stage}", file=sys.stderr, flush=True)
 
 
 def parse_args():
@@ -417,16 +423,24 @@ def canonicalize_convolutions(model):
 
 
 def convert(a, report):
+    record_stage(report, "import_numpy")
     import numpy as np
+    record_stage(report, "import_torch")
     import torch
+    record_stage(report, "import_onnx")
     import onnx
+    record_stage(report, "import_onnxruntime")
     import onnxruntime as ort
+    record_stage(report, "import_tensorflow")
     import tensorflow as tf
+    record_stage(report, "import_model")
     from neural_style import transformer_net
 
     if not hasattr(transformer_net, "load_checkpoint"):
         raise ValueError("Model module must expose load_checkpoint(path) and net.fused(); legacy checkpoints are unsupported")
+    record_stage(report, "load_checkpoint")
     net, metadata = transformer_net.load_checkpoint(a.model)
+    record_stage(report, "validate_checkpoint")
     checkpoint_shape = transformer_net.checkpoint_dimensions(metadata)
     architecture = metadata["architecture"]
     if architecture == BN_ARCHITECTURE:
@@ -440,9 +454,11 @@ def convert(a, report):
     a.size = dimensions((a.height, a.input_width) if a.height is not None else
                         a.size if a.size is not None else checkpoint_shape)
     height, image_width = a.size
+    record_stage(report, "discover_calibration")
     files = sorted(p for p in Path(a.calib).rglob("*") if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"})[:a.calib_count]
     if not files:
         raise ValueError(f"No calibration jpg/jpeg/png images under {a.calib}")
+    record_stage(report, "prepare_model_report")
     report.update(metadata=metadata, size=list(a.size), input_shape=[1, height, image_width, 3],
                   compute=compute_budget(architecture, a.size),
                   calibration={"count": len(files), "files": [str(p.resolve()) for p in files],
@@ -451,6 +467,7 @@ def convert(a, report):
         input_shape=[1, height, image_width, 3],
         operator_counts={name: sum(row[0] == name for row in expected_layers(architecture, *a.size))
                          for name in sorted({row[0] for row in expected_layers(architecture, *a.size)})})
+    record_stage(report, "fuse_batchnorm")
     if any(m.training for m in net.modules()) or any(t.device.type != "cpu" for t in list(net.parameters()) + list(net.buffers())):
         raise ValueError("load_checkpoint must return an eval CPU model")
     fused = net.fused()
@@ -473,12 +490,14 @@ def convert(a, report):
                 conv.groups != (ci if name == "DEPTHWISE_CONV_2D" else 1) or
                 conv.stride != (stride, stride) or conv.dilation != (1, 1) or conv.padding_mode != "zeros"):
             raise ValueError("Checkpoint convolution differs from deployment profile")
+    record_stage(report, "prepare_inputs")
     image = preprocess(a.content or files[0], a.size)
     rng = np.random.default_rng(0)
     probes = [image.transpose(0, 3, 1, 2).copy(),
                rng.uniform(0, 255, (1, 3, height, image_width)).astype(np.float32),
                np.zeros((1, 3, height, image_width), dtype=np.float32)]
     references = []
+    record_stage(report, "pytorch_parity")
     with torch.inference_mode():
         for i, x in enumerate(probes):
             ref = net(torch.from_numpy(x)).numpy()
@@ -487,20 +506,25 @@ def convert(a, report):
                 raise ValueError(f"Model output must preserve RGB image shape, got {out.shape}")
             require_parity(ref, out, f"pytorch_unfused_vs_fused_{i}", report)
             references.append(out)
+        record_stage(report, "onnx_export")
         torch.onnx.export(fused, torch.from_numpy(probes[0]), a.onnx, opset_version=13,
                           dynamo=False, input_names=["input"], output_names=["output"],
                           dynamic_axes=None, do_constant_folding=True)
+    record_stage(report, "onnx_canonicalization")
     exported = canonicalize_convolutions(onnx.load(a.onnx))
     onnx.checker.check_model(exported)
     onnx.save(exported, a.onnx)
+    record_stage(report, "onnx_parity")
     session = ort.InferenceSession(str(a.onnx), providers=["CPUExecutionProvider"])
     for i, x in enumerate(probes):
         out = session.run(None, {session.get_inputs()[0].name: x})[0]
         require_parity(references[i], out, f"pytorch_fused_vs_onnx_{i}", report)
     report["artifacts"]["onnx"] = str(Path(a.onnx).resolve())
+    record_stage(report, "onnx_to_saved_model")
     saved = Path(tempfile.mkdtemp(prefix="run-", dir=a.saved_model))
     report["artifacts"]["saved_model"] = str(saved.resolve())
     subprocess.run(["onnx2tf", "-i", str(Path(a.onnx).resolve()), "-o", str(saved.resolve()), "-b", "1"], check=True)
+    record_stage(report, "saved_model_parity")
     loaded = tf.saved_model.load(str(saved))
     if "serving_default" not in loaded.signatures:
         raise ValueError("SavedModel lacks serving_default signature")
@@ -527,6 +551,7 @@ def convert(a, report):
             pixels = preprocess(path, a.size)
             yield {input_name: pixels if layout == "NHWC" else pixels.transpose(0, 3, 1, 2).copy()}
 
+    record_stage(report, "tflite_quantization")
     converter = tf.lite.TFLiteConverter.from_saved_model(str(saved), signature_keys=["serving_default"])
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
     converter.representative_dataset = representative_dataset
@@ -536,10 +561,12 @@ def convert(a, report):
     data = converter.convert()
     Path(a.int8_tflite).write_bytes(data)
     report["artifacts"]["int8_tflite"] = str(Path(a.int8_tflite).resolve())
+    record_stage(report, "tflite_audit")
     report["audit"] = audit_tflite(data, a.size, architecture)
     report["blockers"].extend(report["audit"]["blockers"])
     if report["blockers"]:
         return
+    record_stage(report, "int8_verification")
     interpreter = tf.lite.Interpreter(model_content=data, experimental_delegates=[],
         experimental_op_resolver_type=tf.lite.experimental.OpResolverType.BUILTIN_WITHOUT_DEFAULT_DELEGATES)
     interpreter.allocate_tensors()
@@ -598,14 +625,18 @@ def main():
         "hardware_proven": False,
         "scope": "Software parity and FlatBuffer compatibility screen only; no Ti60 compilation, placement or hardware execution proof."}
     try:
+        record_stage(report, "prepare_outputs")
         for path in paths:
             path.parent.mkdir(parents=True, exist_ok=True)
         Path(a.saved_model).mkdir(parents=True, exist_ok=True)
         convert(a, report)
         if not report["blockers"]:
             report["status"] = "software_checks_passed_hardware_unproven"
+            record_stage(report, "complete")
     except Exception as exc:
         report["blockers"].append(f"{type(exc).__name__}: {exc}")
+        report["traceback"] = traceback.format_exc()
+        print(report["traceback"], file=sys.stderr, end="", flush=True)
     finally:
         Path(a.report).parent.mkdir(parents=True, exist_ok=True)
         Path(a.report).write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")

@@ -1,21 +1,89 @@
 """No training or downloads: python -m unittest discover -s fast_neural_style -p 'test_ti60.py'."""
 import copy
+import contextlib
 import importlib.util
+import io
+import json
 from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from script import model2tf_lite as converter
 from script.model2tf_lite import (
     BN_ARCHITECTURE, DW_ARCHITECTURE, compute_budget, expected_layers,
     metrics, preprocess, require_parity, validate_graph,
 )
 
 HAS_TORCH = importlib.util.find_spec("torch") is not None
+
+
+class ConversionDiagnosticsTests(unittest.TestCase):
+    def run_conversion(self, conversion):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "style_int8.tflite"
+            arguments = ["model2tf_lite.py", "--model", str(root / "model.model"),
+                         "--calib", str(root / "calib"), "--onnx", str(root / "style.onnx"),
+                         "--saved-model", str(root / "saved_model"), "--int8-tflite", str(output)]
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with (mock.patch.object(sys, "argv", arguments),
+                  mock.patch.object(converter, "convert", side_effect=conversion),
+                  contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr)):
+                exit_code = converter.main()
+            report = json.loads(Path(str(output) + ".report.json").read_text(encoding="utf-8"))
+        return exit_code, report, stdout.getvalue(), stderr.getvalue()
+
+    def test_recursion_failure_preserves_stage_and_traceback(self):
+        def fail_conversion(args, report):
+            converter.record_stage(report, "import_tensorflow")
+            raise RecursionError("simulated import recursion")
+
+        exit_code, report, stdout, stderr = self.run_conversion(fail_conversion)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["stage"], "import_tensorflow")
+        self.assertEqual(report["blockers"], ["RecursionError: simulated import recursion"])
+        self.assertEqual(report["parity"], {})
+        self.assertEqual(report["artifacts"], {})
+        self.assertFalse(report["hardware_proven"])
+        self.assertIn("Traceback (most recent call last):", report["traceback"])
+        self.assertIn("fail_conversion", report["traceback"])
+        self.assertIn(report["blockers"][0], report["traceback"])
+        self.assertIn("[stage] import_tensorflow", stderr)
+        self.assertIn(report["traceback"], stderr)
+        self.assertIn("Report:", stdout)
+
+    def test_success_marks_completion_without_hardware_proof(self):
+        exit_code, report, stdout, stderr = self.run_conversion(lambda args, report: None)
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(report["status"], "software_checks_passed_hardware_unproven")
+        self.assertEqual(report["stage"], "complete")
+        self.assertEqual(report["blockers"], [])
+        self.assertFalse(report["hardware_proven"])
+        self.assertNotIn("traceback", report)
+        self.assertIn("[stage] complete", stderr)
+        self.assertIn("Report:", stdout)
+
+    def test_audit_blocker_preserves_failed_stage_without_traceback(self):
+        def reject_graph(args, report):
+            converter.record_stage(report, "tflite_audit")
+            report["blockers"].append("Unsupported operator")
+
+        exit_code, report, stdout, stderr = self.run_conversion(reject_graph)
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["stage"], "tflite_audit")
+        self.assertFalse(report["hardware_proven"])
+        self.assertNotIn("traceback", report)
+        self.assertIn("BLOCKER: Unsupported operator", stderr)
+        self.assertNotIn("[stage] complete", stderr)
+        self.assertIn("Report:", stdout)
 
 
 class ConversionTests(unittest.TestCase):
