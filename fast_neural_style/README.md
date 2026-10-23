@@ -14,6 +14,48 @@ Training does not clamp output; preview saving clips it to 0..255.
 The perceptual loss follows [Perceptual Losses for Real-Time Style Transfer](https://arxiv.org/abs/1603.08155).
 VGG16 is used only during training and is not exported.
 
+## Compact Residual Candidate For VGA30
+
+The quality reference is a `ti60_style_bn_3x3_v1`, width `0.25`, 128x128
+checkpoint. The new opt-in `--architecture bn_c8_r2` uses a separate ID,
+`ti60_style_bn_c8_r2_v1`. It preserves two residual blocks and spatial decoding:
+
+```text
+RGB -> Conv3x3/s2 C4 -> Conv3x3/s2 C8 -> 2 residual blocks (C8)
+    -> nearest 2x -> Conv3x3 C4 + ReLU -> nearest 2x -> linear Conv3x3 RGB
+```
+
+All eight convolutions are ordinary 3x3, with two ADDs and two 2x resizes.
+There is no Depthwise, InstanceNorm, reflection pad or output clamp. BN folds
+into convolution. Unlike DW-C4-S, the decoder is not forced to repeat 4x4 blocks.
+The existing default remains `dw_c4_s`; select the new architecture explicitly,
+without `--width`. Train it from scratch in a separate directory; the larger
+checkpoint is a visual reference, not a shape-compatible initialization.
+
+| Logical quantity | BN width 0.25 | BN-C8-R2 |
+|---|---:|---:|
+| Convolution MAC/frame at 640x480 | 2,786,918,400 | 113,356,800 |
+| INT8 convolution weight bytes, excluding bias/tables | 104,112 | 3,096 |
+| Largest logical INT8 activation, including resize outputs | 4,915,200 bytes | 1,228,800 bytes |
+
+The candidate has 3,243 trainable parameters (including BN), 204 bytes of
+INT32 convolution biases after folding, and 6,045,696 convolution MAC/frame at
+128x128. VGA30 requires **3.400704 GMAC/s for convolution alone**, not measured
+throughput. Neither the ~24.6x logical MAC reduction nor the small weight count
+proves 30 FPS, FPGA utilization, tensor-arena size or acceptable image quality.
+The full-frame tensors still require a suitable external-memory/streaming design.
+This change does not modify Iris firmware, RTL or board artifacts.
+
+Add `--preview-image images/content-images/cobi.jpg --preview-interval 1000`
+to training to save unfused FP32 eval previews at the training size and 480x640,
+every 1,000 batches and at epoch end. Preprocessed inputs and previews go under
+`<save-model-dir>/previews` unless `--preview-dir` is supplied. Previews do not
+update BN statistics and restore all module training flags, including on failure.
+Use the reference run's loss weights where available; checkpoint metadata does
+not recover those settings. Do not change architecture and loss weights together
+and then attribute the result only to architecture. Judge float previews first.
+See the Chinese usage guide for the complete server command.
+
 ## Training
 
 Run from this directory. Install a matching CUDA PyTorch/torchvision pair on the
@@ -92,7 +134,8 @@ Iris resolver update, strict hardware guards before DW CPU execution, synchroniz
 model_contract/profiler changes and Generator regeneration. Main-program model
 enable flags are separate and are not switched on automatically.
 
-Target B is 640x480 at 60 fps, unproven: 12,979,200 convolution MAC/frame requires
+The historical DW 640x480/60 fps budget remains a comparison, not the current
+compact candidate's VGA30 acceptance target: 12,979,200 convolution MAC/frame requires
 0.778752 GMAC/s for convolution alone and about 16.67 ms for the whole pipeline.
 Benchmark STANDARD 4x2/8x2. Historical original 128x128 Rain at vendor 8x2, 100 MHz
 took 354.55 ms Invoke (about 0.453 GMAC/s effective convolution throughput); this
@@ -112,7 +155,8 @@ original strict FP32 results in `parity`. Each also must pass the experimental
 FP32 budget and a separate FP64 folding equivalence check using the original
 strict tolerances. Budget/equivalence failures are collected across the probes
 and block ONNX export; invalid shapes or non-finite results still abort immediately.
-ONNX/SavedModel parity, INT8 conversion and graph audit are not relaxed.
+With only this folding option, ONNX/SavedModel parity still uses the original FP32
+reference and strict tolerances. INT8 conversion and graph audit are not relaxed.
 
 Review `folding_experiment.probes` and `folding_experiment.strict_failures`.
 Completed experiments always have status
@@ -121,6 +165,31 @@ if their original strict folding checks also pass. They are not strict acceptanc
 or hardware proof. Failures still exit 1; invalid arguments exit 2. Without the
 option, strict completion still exits 0. Check more content images before choosing
 any acceptance budget; calibration images are not a multi-image parity test.
+
+## Experimental FP64 Export Reference
+
+If cross-runtime FP32 comparisons fail after folding, an additional explicit
+`--experimental-fused-fp64-reference` option can be used with the folding budget.
+This changes the experimental ONNX/SavedModel reference policy, not the numeric
+tolerances or the exported model. It is not enabled by the folding option alone.
+
+The converter copies the already-fused FP32 export parameters and upcasts that
+copy to FP64, without re-fusing BN in FP64 or changing the export parameters.
+All three inputs must first pass a strict comparison between the unfused model
+and those export parameters, both evaluated in FP64. ONNX and SavedModel are then
+compared to this validated reference with `atol=0.01, rtol=0.0001`; the original
+FP32 comparisons remain in `parity`, including failures. The new comparisons and
+reference validation are recorded in `fp64_reference`. Any new-reference failure
+still blocks conversion. The same high-precision reference policy is used for
+ONNX and SavedModel on every probe; the converter does not choose whichever
+reference happens to pass.
+
+The mode is `experimental_fused_fp64_reference`. Completion still exits 3, never
+0, and is not original strict acceptance or hardware proof. INT8 graph auditing
+is unchanged; `verification.float_reference` identifies the original fused FP32
+baseline still used for INT8 quality metrics. Use separate experimental paths.
+This option is unvalidated on the server checkpoint and may still fail; it does
+not prove that the content-loss weight caused the original discrepancy.
 
 ## Validation
 

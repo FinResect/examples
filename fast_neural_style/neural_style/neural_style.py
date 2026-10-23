@@ -40,6 +40,8 @@ def train(args, device):
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.workers, pin_memory=device.type == "cuda")
     model = create_model(args.architecture, args.width).to(device).train()
+    print(f"Training {model.architecture}: {sum(parameter.numel() for parameter in model.parameters())} parameters; "
+          f"input={dimensions}", flush=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     vgg = Vgg16(requires_grad=False).to(device).eval()
     style = image_transform(args.style_size or dimensions)(
@@ -52,6 +54,17 @@ def train(args, device):
     checkpoint_dir = Path(args.checkpoint_model_dir) if args.checkpoint_model_dir else None
     if checkpoint_dir:
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    previews = {}
+    if args.preview_image:
+        preview_dir = Path(args.preview_dir) if args.preview_dir else output_dir / "previews"
+        preview_dir.mkdir(parents=True, exist_ok=True)
+        preview_sizes = {"native": dimensions}
+        if dimensions != (480, 640):
+            preview_sizes["vga"] = (480, 640)
+        for name, size in preview_sizes.items():
+            inputs = image_transform(size)(utils.load_image(args.preview_image))
+            utils.save_image(preview_dir / f"input_{name}.png", inputs)
+            previews[name] = inputs.unsqueeze(0).to(device)
 
     for epoch in range(1, args.epochs + 1):
         totals = np.zeros(2)
@@ -80,6 +93,11 @@ def train(args, device):
             if checkpoint_dir and step % args.checkpoint_interval == 0:
                 save_checkpoint(checkpoint_dir / f"epoch_{epoch}_batch_{step}.model",
                                 model, dimensions, epoch=epoch, batch=step)
+            if previews and (step % args.preview_interval == 0 or step == len(loader)):
+                for name, inputs in previews.items():
+                    preview_path = preview_dir / f"epoch_{epoch}_batch_{step}_{name}.png"
+                    utils.save_eval_preview(model, inputs, preview_path)
+                    print(f"Saved FP32 eval preview {preview_path}", flush=True)
         path = output_dir / f"ti60_epoch_{epoch}_{time.strftime('%Y%m%d_%H%M%S')}.model"
         save_checkpoint(path, model, dimensions, epoch=epoch)
         print(f"Saved {path}", flush=True)
@@ -110,7 +128,7 @@ def stylize(args, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Ti60 DW-C4-S / legacy BN style transfer")
+    parser = argparse.ArgumentParser(description="Ti60 compact residual / DW-C4-S / legacy BN style transfer")
     commands = parser.add_subparsers(dest="command", required=True)
     training = commands.add_parser("train")
     training.add_argument("--dataset", required=True)
@@ -127,6 +145,10 @@ def main():
     training.add_argument("--lr", type=float, default=1e-3)
     training.add_argument("--log-interval", type=int, default=100)
     training.add_argument("--checkpoint-interval", type=int, default=2000)
+    training.add_argument("--preview-image", help="Fixed validation image for unfused FP32 native/VGA previews")
+    training.add_argument("--preview-dir", help="Preview directory; defaults to <save-model-dir>/previews")
+    training.add_argument("--preview-interval", type=int, default=1000,
+                          help="Preview every N batches and at each epoch end when --preview-image is set")
     evaluation = commands.add_parser("eval")
     evaluation.add_argument("--model", required=True)
     evaluation.add_argument("--content-image", required=True)
@@ -136,14 +158,14 @@ def main():
         command.add_argument("--image-size", type=int, help="square size (train default: 128)")
         command.add_argument("--image-height", type=int)
         command.add_argument("--image-width", type=int)
-        command.add_argument("--architecture", choices=("dw_c4_s", "bn_3x3"),
+        command.add_argument("--architecture", choices=("dw_c4_s", "bn_3x3", "bn_c8_r2"),
                              default="dw_c4_s" if command is training else None)
         command.add_argument("--width", type=float, help="channel multiplier for bn_3x3 only")
         command.add_argument("--accel", action="store_true", help="use CUDA (server training)")
     args = parser.parse_args()
     try:
         image_dimensions(args, (128, 128))
-        if args.width is not None and args.architecture == "dw_c4_s":
+        if args.width is not None and args.architecture in ("dw_c4_s", "bn_c8_r2"):
             raise ValueError("--width is only supported for bn_3x3")
     except ValueError as error:
         parser.error(str(error))
@@ -156,6 +178,10 @@ def main():
             parser.error("epochs, batch-size and intervals must be positive; workers must be nonnegative")
         if args.style_size is not None and args.style_size < 16:
             parser.error("--style-size must be >=16")
+        if args.preview_interval < 1:
+            parser.error("--preview-interval must be positive")
+        if args.preview_dir and not args.preview_image:
+            parser.error("--preview-dir requires --preview-image")
         train(args, device)
     else:
         stylize(args, device)

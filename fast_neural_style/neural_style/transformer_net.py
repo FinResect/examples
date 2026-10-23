@@ -7,6 +7,7 @@ from torch import nn
 
 ARCHITECTURE = "ti60_style_bn_3x3_v1"
 DW_ARCHITECTURE = "ti60_style_dw_c4_s_v1"
+COMPACT_ARCHITECTURE = "ti60_style_bn_c8_r2_v1"
 
 
 class ConvLayer(nn.Module):
@@ -68,6 +69,30 @@ class TransformerNet(nn.Module):
         return model.eval()
 
 
+class CompactTransformerNet(nn.Module):
+    """C4/C8 encoder, two C8 residual blocks and spatial convolution decoding."""
+
+    architecture = COMPACT_ARCHITECTURE
+
+    def __init__(self):
+        super().__init__()
+        self.conv1 = ConvLayer(3, 4, stride=2)
+        self.conv2 = ConvLayer(4, 8, stride=2)
+        self.residuals = nn.Sequential(*(ResidualBlock(8) for _ in range(2)))
+        self.up1 = ConvLayer(8, 4)
+        self.output = ConvLayer(4, 3, normalize=False)
+
+    def forward(self, inputs):
+        features = torch.relu(self.conv1(inputs))
+        features = torch.relu(self.conv2(features))
+        features = self.residuals(features)
+        features = torch.relu(self.up1(nn.functional.interpolate(features, scale_factor=2, mode="nearest")))
+        return self.output(nn.functional.interpolate(features, scale_factor=2, mode="nearest"))
+
+    def fused(self):
+        return TransformerNet.fused(self)
+
+
 class DWTransformerNet(nn.Module):
     """DW-C4-S: 7 depthwise, 9 pointwise, 2 resizes; 12,979,200 VGA MACs."""
 
@@ -101,6 +126,10 @@ class DWTransformerNet(nn.Module):
 
 def create_model(architecture="dw_c4_s", width=None):
     """Build from a CLI name or checkpoint architecture ID; width is BN-only."""
+    if architecture in ("bn_c8_r2", COMPACT_ARCHITECTURE):
+        if width is not None:
+            raise ValueError("--width is only supported for bn_3x3")
+        return CompactTransformerNet()
     if architecture in ("dw_c4_s", DW_ARCHITECTURE):
         if width is not None:
             raise ValueError("--width is only supported for bn_3x3")
@@ -112,7 +141,7 @@ def create_model(architecture="dw_c4_s", width=None):
 
 def checkpoint_dimensions(metadata):
     """Return validated (height, width), including shipped square BN checkpoints."""
-    if metadata.get("architecture") not in (ARCHITECTURE, DW_ARCHITECTURE):
+    if metadata.get("architecture") not in (ARCHITECTURE, DW_ARCHITECTURE, COMPACT_ARCHITECTURE):
         raise ValueError("Unsupported checkpoint architecture")
     if "image_height" in metadata or "image_width" in metadata:
         height, width = metadata.get("image_height"), metadata.get("image_width")
@@ -127,6 +156,11 @@ def checkpoint_dimensions(metadata):
         raise ValueError("Checkpoint dimensions must be >=16 and divisible by four")
     if metadata["architecture"] == DW_ARCHITECTURE and "image_height" not in metadata:
         raise ValueError("DW checkpoint requires image_height and image_width")
+    if metadata["architecture"] == COMPACT_ARCHITECTURE:
+        if "image_height" not in metadata:
+            raise ValueError("Compact checkpoint requires image_height and image_width")
+        if "width" in metadata:
+            raise ValueError("Compact checkpoint has fixed channels; width is not supported")
     return height, width
 
 
@@ -137,7 +171,7 @@ def save_checkpoint(path, model, image_size, **extra):
                 "image_size": height if height == width else (height, width)}
     if model.architecture == ARCHITECTURE:
         metadata["width"] = model.width
-    if model.architecture == DW_ARCHITECTURE or height != width:
+    if model.architecture in (DW_ARCHITECTURE, COMPACT_ARCHITECTURE) or height != width:
         metadata.update(image_height=height, image_width=width)
     checkpoint_dimensions(metadata)
     torch.save({

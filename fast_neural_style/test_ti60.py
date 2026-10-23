@@ -16,7 +16,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from script import model2tf_lite as converter
 from script.model2tf_lite import (
-    BN_ARCHITECTURE, DW_ARCHITECTURE, compute_budget, expected_layers,
+    BN_ARCHITECTURE, DW_ARCHITECTURE, COMPACT_ARCHITECTURE, compute_budget, expected_layers,
     diagnose_bn_folding, metrics, parity_metrics, preprocess, require_parity, validate_graph,
 )
 
@@ -261,6 +261,20 @@ class ConversionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "architecture"):
             compute_budget("unknown", (16, 20))
 
+    def test_compact_budget_counts_weights_activations_and_vga30_requirement(self):
+        budget = compute_budget(COMPACT_ARCHITECTURE, (480, 640))
+        self.assertEqual(budget["macs_per_frame"], 113_356_800)
+        self.assertEqual(budget["weight_bytes"], 3096)
+        self.assertEqual(budget["bias_bytes"], 204)
+        self.assertEqual(budget["largest_activation_bytes"], 1_228_800)
+        self.assertEqual(budget["io_tensor_bytes"], {"input": 921_600, "output": 921_600})
+        target = next(row for row in budget["targets"] if row["fps"] == 30)
+        self.assertAlmostEqual(target["required_gmac_per_second"], 3.400704)
+        self.assertEqual(compute_budget(COMPACT_ARCHITECTURE, 128)["macs_per_frame"], 6_045_696)
+        self.assertEqual(compute_budget(COMPACT_ARCHITECTURE, (720, 1280))["macs_per_frame"], 340_070_400)
+        self.assertEqual(compute_budget(BN_ARCHITECTURE, (480, 640))["macs_per_frame"], 2_786_918_400)
+        self.assertEqual(compute_budget(BN_ARCHITECTURE, (480, 640))["largest_activation_bytes"], 4_915_200)
+
     def test_parity_rejects_bad_results(self):
         report = {"parity": {}}
         reference = np.zeros((1, 3, 4, 4), dtype=np.float32)
@@ -364,13 +378,17 @@ class ExportReferenceTests(unittest.TestCase):
 
 
 class GraphValidationTests(unittest.TestCase):
-    def dw_graph(self):
-        profile = expected_layers(DW_ARCHITECTURE, 16, 20)
+    def dw_graph(self, architecture=DW_ARCHITECTURE):
+        profile = expected_layers(architecture, 16, 20)
         tensors = [{"shape": [1, 16, 20, 3], "dtype": "INT8", "constant": False,
                     "scales": [0.25], "zero_points": [-3], "quantized_dimension": 0}]
         ops = []
         current = 0
+        skip = None
+        residual_starts = {index - 2 for index, row in enumerate(profile) if row[0] == "ADD"}
         for index, (name, h, w, ci, co, kernel, stride) in enumerate(profile):
+            if index in residual_starts:
+                skip = current
             inputs = [current]
             options = {"FusedActivationFunction": "NONE"}
             if kernel:
@@ -387,9 +405,12 @@ class GraphValidationTests(unittest.TestCase):
                 ])
                 options.update(StrideH=stride, StrideW=stride, Padding="SAME",
                                DilationHFactor=1, DilationWFactor=1,
-                               FusedActivationFunction="NONE" if index == len(profile) - 1 else "RELU")
+                               FusedActivationFunction="NONE" if index == len(profile) - 1 or
+                               profile[index + 1][0] == "ADD" else "RELU")
                 if dw:
                     options["DepthMultiplier"] = 1
+            elif name == "ADD":
+                inputs.append(skip)
             else:
                 inputs.append(len(tensors))
                 tensors.append({"shape": [2], "dtype": "INT32", "constant": True,
@@ -401,6 +422,50 @@ class GraphValidationTests(unittest.TestCase):
             ops.append({"name": name, "inputs": inputs, "outputs": [output], "options": options})
             current = output
         return tensors, ops, profile
+
+    def test_compact_profile_preserves_spatial_decoder_and_residuals(self):
+        tensors, ops, profile = self.dw_graph(COMPACT_ARCHITECTURE)
+        self.assertEqual(profile, [
+            ("CONV_2D", 8, 10, 3, 4, 3, 2),
+            ("CONV_2D", 4, 5, 4, 8, 3, 2),
+        ] + [
+            ("CONV_2D", 4, 5, 8, 8, 3, 1),
+            ("CONV_2D", 4, 5, 8, 8, 3, 1),
+            ("ADD", 4, 5, 8, 8, 0, 1),
+        ] * 2 + [
+            ("RESIZE_NEAREST_NEIGHBOR", 8, 10, 8, 8, 0, 2),
+            ("CONV_2D", 8, 10, 8, 4, 3, 1),
+            ("RESIZE_NEAREST_NEIGHBOR", 16, 20, 4, 4, 0, 2),
+            ("CONV_2D", 16, 20, 4, 3, 3, 1),
+        ])
+        blockers = []
+        validate_graph(tensors, ops, profile, blockers, 0)
+        self.assertEqual(blockers, [])
+
+    def test_legacy_residual_graph_still_passes(self):
+        tensors, ops, profile = self.dw_graph(BN_ARCHITECTURE)
+        self.assertEqual(len(ops), 23)
+        blockers = []
+        validate_graph(tensors, ops, profile, blockers, 0)
+        self.assertEqual(blockers, [])
+
+    def test_compact_graph_rejects_bad_skips_and_nonlinear_residual_heads(self):
+        for defect in ("skip", "second_conv", "output", "missing_block_start", "decoder"):
+            with self.subTest(defect=defect):
+                tensors, ops, profile = self.dw_graph(COMPACT_ARCHITECTURE)
+                if defect == "skip":
+                    ops[4]["inputs"][1] = ops[3]["outputs"][0]
+                elif defect == "second_conv":
+                    ops[3]["options"]["FusedActivationFunction"] = "RELU"
+                elif defect == "output":
+                    ops[-1]["options"]["FusedActivationFunction"] = "RELU"
+                elif defect == "missing_block_start":
+                    ops[2]["name"] = "DEPTHWISE_CONV_2D"
+                else:
+                    tensors[ops[-1]["inputs"][1]]["shape"] = [3, 1, 1, 4]
+                blockers = []
+                validate_graph(tensors, ops, profile, blockers, 0)
+                self.assertTrue(blockers)
 
     def test_dw_profile_order_counts_and_valid_quantized_pipeline(self):
         tensors, ops, profile = self.dw_graph()
@@ -683,6 +748,13 @@ class ModelTests(unittest.TestCase):
 
         self.check_export_padding(DWTransformerNet, (16, 20), depthwise=True)
 
+    @unittest.skipUnless(all(importlib.util.find_spec(name) is not None for name in ("onnx", "onnxsim", "onnxruntime")),
+                         "ONNX conversion dependencies are not installed")
+    def test_compact_rectangular_export_preserves_residuals_and_spatial_decoder(self):
+        from neural_style.transformer_net import CompactTransformerNet
+
+        self.check_export_padding(CompactTransformerNet, (16, 20))
+
     def check_export_padding(self, factory, shape, depthwise=False):
         import torch
         import onnx
@@ -706,6 +778,15 @@ class ModelTests(unittest.TestCase):
                               input_names=["input"], output_names=["output"])
             model = canonicalize_convolutions(onnx.load(path))
             self.assertFalse(any(node.op_type == "Pad" for node in model.graph.node))
+            if net.architecture == COMPACT_ARCHITECTURE:
+                for name, count in (("Conv", 8), ("Add", 2), ("Resize", 2)):
+                    self.assertEqual(sum(node.op_type == name for node in model.graph.node), count)
+                for node in model.graph.node:
+                    if node.op_type == "Conv":
+                        attributes = {attribute.name: onnx.helper.get_attribute_value(attribute)
+                                      for attribute in node.attribute}
+                        self.assertEqual(attributes["auto_pad"], b"SAME_UPPER")
+                        self.assertEqual(attributes.get("group", 1), 1)
             if depthwise:
                 weights = {item.name: onnx.numpy_helper.to_array(item) for item in model.graph.initializer}
                 convs = [node for node in model.graph.node if node.op_type == "Conv"]
@@ -739,7 +820,12 @@ class ModelTests(unittest.TestCase):
 
         self.check_shapes_and_folding(DWTransformerNet, ((16, 20), (48, 64)))
 
-    def check_shapes_and_folding(self, factory, shapes):
+    def test_compact_shapes_and_folding_with_nontrivial_bn(self):
+        from neural_style.transformer_net import CompactTransformerNet
+
+        self.check_shapes_and_folding(CompactTransformerNet, ((16, 20), (48, 64)), convolutions=8)
+
+    def check_shapes_and_folding(self, factory, shapes, convolutions=16):
         import torch
 
         torch.set_num_threads(1)
@@ -756,13 +842,126 @@ class ModelTests(unittest.TestCase):
             self.assertIsNot(fused, net)
             self.assertFalse(any(module.training for module in fused.modules()))
             self.assertFalse(any(isinstance(m, torch.nn.BatchNorm2d) for m in fused.modules()))
-            self.assertEqual(sum(isinstance(m, torch.nn.Conv2d) for m in fused.modules()), 16)
-            self.assertEqual(sum(isinstance(m, torch.nn.BatchNorm2d) for m in net.modules()), 15)
+            self.assertEqual(sum(isinstance(m, torch.nn.Conv2d) for m in fused.modules()), convolutions)
+            self.assertEqual(sum(isinstance(m, torch.nn.BatchNorm2d) for m in net.modules()), convolutions - 1)
             for height, width in shapes:
                 x = torch.rand(1, 3, height, width) * 255
                 ref = net(x)
                 self.assertEqual(ref.shape, x.shape)
                 torch.testing.assert_close(ref, fused(x), atol=0.01, rtol=0.0001)
+
+    def test_compact_factory_and_profile_match_actual_convolutions(self):
+        import torch
+        from neural_style.transformer_net import CompactTransformerNet, create_model
+
+        torch.set_num_threads(1)
+        for name in ("bn_c8_r2", COMPACT_ARCHITECTURE):
+            self.assertIsInstance(create_model(name), CompactTransformerNet)
+            with self.assertRaisesRegex(ValueError, "width"):
+                create_model(name, width=0.25)
+        model = create_model("bn_c8_r2").eval()
+        self.assertEqual(sum(parameter.numel() for parameter in model.parameters()), 3243)
+        convolutions = [module for module in model.modules() if isinstance(module, torch.nn.Conv2d)]
+        self.assertEqual(sum(module.weight.numel() for module in convolutions), 3096)
+        self.assertTrue(all(module.kernel_size == (3, 3) and module.groups == 1 for module in convolutions))
+        self.assertEqual(len(model.residuals), 2)
+        actual = []
+
+        def record(module, inputs, output):
+            actual.append((tuple(output.shape), module.in_channels, module.stride[0],
+                           output.shape[-2] * output.shape[-1] * module.weight.numel()))
+
+        handles = [module.register_forward_hook(record) for module in convolutions]
+        try:
+            with torch.inference_mode():
+                output = model(torch.ones(1, 3, 16, 20))
+        finally:
+            for handle in handles:
+                handle.remove()
+        self.assertEqual(tuple(output.shape), (1, 3, 16, 20))
+        profile = expected_layers(COMPACT_ARCHITECTURE, 16, 20)
+        expected = [((1, channels_out, height, width), channels_in, stride,
+                     height * width * channels_in * channels_out * kernel * kernel)
+                    for name, height, width, channels_in, channels_out, kernel, stride in profile if kernel]
+        self.assertEqual(actual, expected)
+        self.assertEqual(sum(row[-1] for row in actual), compute_budget(COMPACT_ARCHITECTURE, (16, 20))["macs_per_frame"])
+
+    def test_compact_decoder_is_not_forced_to_repeat_four_by_four_blocks(self):
+        import torch
+        from neural_style.transformer_net import CompactTransformerNet
+
+        torch.set_num_threads(1)
+        model = CompactTransformerNet().eval().fused()
+        with torch.no_grad():
+            for module in model.modules():
+                if isinstance(module, torch.nn.Conv2d):
+                    module.weight.fill_(1 / module.weight[0].numel())
+                    module.bias.fill_(0.25)
+            inputs = torch.arange(3 * 16 * 20, dtype=torch.float32).reshape(1, 3, 16, 20) % 256
+            output = model(inputs)
+            blocks = output[:, :, 4:-4, 4:-4].reshape(1, 3, 2, 4, 3, 4)
+            variation = blocks.amax(dim=(3, 5)) - blocks.amin(dim=(3, 5))
+            self.assertGreater(float(variation.max()), 0.01)
+            model.output.conv.weight.zero_()
+            model.output.conv.bias.copy_(torch.tensor([-3., 2., 300.]))
+            output = model(inputs)
+            expected = torch.tensor([-3., 2., 300.]).reshape(1, 3, 1, 1).expand_as(output)
+            torch.testing.assert_close(output, expected)
+
+    def test_compact_training_backward_reaches_all_parameters(self):
+        import torch
+        from neural_style.transformer_net import CompactTransformerNet
+
+        torch.set_num_threads(1)
+        torch.manual_seed(12)
+        model = CompactTransformerNet().train()
+        output = model(torch.rand(2, 3, 16, 20) * 255)
+        output.square().mean().backward()
+        for parameter in model.parameters():
+            self.assertIsNotNone(parameter.grad)
+            self.assertTrue(torch.isfinite(parameter.grad).all())
+
+    def test_training_preview_preserves_batchnorm_state_and_training_modes(self):
+        import torch
+        from neural_style import utils
+        from neural_style.transformer_net import CompactTransformerNet
+
+        torch.set_num_threads(1)
+        model = CompactTransformerNet().train()
+        model.conv1.bn.eval()
+        modes = [module.training for module in model.modules()]
+        state = copy.deepcopy(model.state_dict())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "preview.png"
+            utils.save_eval_preview(model, torch.ones(1, 3, 16, 20), path)
+            with Image.open(path) as preview:
+                self.assertEqual(preview.size, (20, 16))
+                self.assertEqual(preview.mode, "RGB")
+        self.assertEqual([module.training for module in model.modules()], modes)
+        for name, value in model.state_dict().items():
+            torch.testing.assert_close(value, state[name], rtol=0, atol=0)
+
+    def test_training_preview_failure_restores_modes_and_rejects_nonfinite(self):
+        import torch
+        from neural_style import utils
+        from neural_style.transformer_net import CompactTransformerNet
+
+        torch.set_num_threads(1)
+        model = CompactTransformerNet().train()
+        model.conv1.bn.eval()
+        modes = [module.training for module in model.modules()]
+        inputs = torch.ones(1, 3, 16, 20)
+        with mock.patch.object(utils, "save_image", side_effect=OSError("cannot save")):
+            with self.assertRaisesRegex(OSError, "cannot save"):
+                utils.save_eval_preview(model, inputs, "unused.png")
+        self.assertEqual([module.training for module in model.modules()], modes)
+        with torch.no_grad():
+            model.output.conv.bias.fill_(float("nan"))
+        with mock.patch.object(utils, "save_image") as save:
+            with self.assertRaisesRegex(RuntimeError, "Non-finite"):
+                utils.save_eval_preview(model, inputs, "unused.png")
+            save.assert_not_called()
+        self.assertEqual([module.training for module in model.modules()], modes)
 
     def test_default_dw_factory_structure_and_linear_rgb_head(self):
         import operator
@@ -895,6 +1094,42 @@ class ModelTests(unittest.TestCase):
                 checkpoint_dimensions({**valid, **changes})
         with self.assertRaisesRegex(ValueError, "requires image_height"):
             checkpoint_dimensions({"architecture": DW_ARCHITECTURE, "image_size": 16})
+
+    def test_compact_checkpoint_roundtrip_and_architecture_isolation(self):
+        import torch
+        from neural_style.transformer_net import (
+            CompactTransformerNet, checkpoint_dimensions, load_checkpoint, save_checkpoint,
+        )
+
+        torch.set_num_threads(1)
+        model = CompactTransformerNet().eval()
+        model.conv1.bn.running_mean.fill_(7)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "compact.model"
+            for size in (128, (16, 20)):
+                with self.subTest(size=size):
+                    save_checkpoint(path, model, size, epoch=2)
+                    restored, metadata = load_checkpoint(path)
+                    self.assertIsInstance(restored, CompactTransformerNet)
+                    self.assertEqual(metadata["architecture"], COMPACT_ARCHITECTURE)
+                    self.assertNotIn("width", metadata)
+                    self.assertEqual(checkpoint_dimensions(metadata), (128, 128) if size == 128 else size)
+                    self.assertFalse(any(module.training for module in restored.modules()))
+                    for name, value in model.state_dict().items():
+                        torch.testing.assert_close(restored.state_dict()[name], value)
+                    with torch.inference_mode():
+                        inputs = torch.ones(1, 3, 16, 20)
+                        torch.testing.assert_close(model(inputs), restored(inputs))
+            checkpoint = torch.load(path, weights_only=True)
+            checkpoint["metadata"].update(architecture=BN_ARCHITECTURE, width=0.25)
+            torch.save(checkpoint, path)
+            with self.assertRaises(RuntimeError):
+                load_checkpoint(path)
+        with self.assertRaisesRegex(ValueError, "requires image_height"):
+            checkpoint_dimensions({"architecture": COMPACT_ARCHITECTURE, "image_size": 128})
+        with self.assertRaisesRegex(ValueError, "width"):
+            checkpoint_dimensions({"architecture": COMPACT_ARCHITECTURE, "image_size": 128,
+                                   "image_height": 128, "image_width": 128, "width": 0.25})
 
 
 if __name__ == "__main__":

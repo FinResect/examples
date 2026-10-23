@@ -18,6 +18,21 @@ def save_image(filename, data):
     img.save(filename)
 
 
+def save_eval_preview(model, inputs, filename):
+    """Save an unfused FP32 eval preview without updating BN or training modes."""
+    modes = [(module, module.training) for module in model.modules()]
+    try:
+        model.eval()
+        with torch.inference_mode():
+            output = model(inputs).cpu()
+        if not torch.isfinite(output).all():
+            raise RuntimeError("Non-finite FP32 preview output")
+        save_image(filename, output[0])
+    finally:
+        for module, training in modes:
+            module.training = training
+
+
 def gram_matrix(y):
     (b, ch, h, w) = y.size()
     features = y.view(b, ch, w * h)

@@ -1,4 +1,4 @@
-"""Convert metadata-bearing DW or legacy BN models to candidate Ti60 INT8 artifacts.
+"""Convert metadata-bearing compact BN, DW or legacy BN models to Ti60 INT8 candidates.
 
 Every invocation runs every stage. The old skip flags are intentionally removed.
 An operator audit is a necessary condition, not proof of hardware deployment.
@@ -81,6 +81,7 @@ def preprocess(path, size):
 
 BN_ARCHITECTURE = "ti60_style_bn_3x3_v1"
 DW_ARCHITECTURE = "ti60_style_dw_c4_s_v1"
+COMPACT_ARCHITECTURE = "ti60_style_bn_c8_r2_v1"
 
 
 def dimensions(size):
@@ -92,6 +93,18 @@ def dimensions(size):
 
 def expected_layers(architecture, height, width):
     """Ordered (opcode, H, W, Cin, Cout, kernel, stride) deployment contract."""
+    if architecture == COMPACT_ARCHITECTURE:
+        quarter_height, quarter_width = height // 4, width // 4
+        layers = [("CONV_2D", height // 2, width // 2, 3, 4, 3, 2),
+                  ("CONV_2D", quarter_height, quarter_width, 4, 8, 3, 2)]
+        for _ in range(2):
+            layers.extend([("CONV_2D", quarter_height, quarter_width, 8, 8, 3, 1),
+                           ("CONV_2D", quarter_height, quarter_width, 8, 8, 3, 1),
+                           ("ADD", quarter_height, quarter_width, 8, 8, 0, 1)])
+        return layers + [("RESIZE_NEAREST_NEIGHBOR", height // 2, width // 2, 8, 8, 0, 2),
+                         ("CONV_2D", height // 2, width // 2, 8, 4, 3, 1),
+                         ("RESIZE_NEAREST_NEIGHBOR", height, width, 4, 4, 0, 2),
+                         ("CONV_2D", height, width, 4, 3, 3, 1)]
     if architecture == DW_ARCHITECTURE:
         layers = []
         h, w = height, width
@@ -127,7 +140,8 @@ def compute_budget(architecture, size):
         weights = kernel * kernel * co * (1 if name == "DEPTHWISE_CONV_2D" else ci)
         macs = h * w * weights
         layers.append({"name": name, "output_shape": [1, h, w, co], "input_channels": ci,
-                       "kernel": kernel, "stride": stride, "weight_bytes": weights, "macs": macs})
+                       "kernel": kernel, "stride": stride, "weight_bytes": weights, "macs": macs,
+                       "bias_bytes": 4 * co if kernel else 0, "output_activation_bytes": h * w * co})
     total = sum(layer["macs"] for layer in layers)
     targets = []
     for h, w, fps in ((480, 640, 15), (480, 640, 30), (480, 640, 60), (720, 1280, 60)):
@@ -135,7 +149,13 @@ def compute_budget(architecture, size):
         targets.append({"height": h, "width": w, "fps": fps, "macs_per_frame": macs,
                         "required_gmac_per_second": macs * fps / 1e9})
     return {"macs_per_frame": total, "weight_bytes": sum(x["weight_bytes"] for x in layers),
+            "bias_bytes": sum(layer["bias_bytes"] for layer in layers),
+            "largest_activation_bytes": max([height * width * 3] +
+                                            [layer["output_activation_bytes"] for layer in layers]),
+            "io_tensor_bytes": {"input": height * width * 3, "output": height * width * 3},
             "layers": layers, "targets": targets,
+            "memory_note": "Logical INT8 tensor sizes and INT32 biases only, not an arena, peak RAM, "
+                           "FlatBuffer size or FPGA resource estimate; excludes quantization tables and buffering.",
             "note": "Logical convolution MACs only; excludes resize, quantization, DMA and dispatch. Not measured FPS."}
 
 
@@ -357,6 +377,7 @@ def build_fused_fp64_references(net, fused, probes, report):
 
 
 def require_export_parity(reference, actual, name, report, fp64_reference=None):
+    """Retain FP32 results; only an explicit validated FP64 reference selects the experimental gate."""
     if fp64_reference is None:
         require_parity(reference, actual, name, report)
         return
@@ -397,7 +418,7 @@ def validate_graph(tensors, ops, profile, blockers, subgraph):
         return
     current = ops[0]["inputs"][0]
     skip = None
-    legacy = any(row[0] == "ADD" for row in profile)
+    residual_starts = {index - 2 for index, row in enumerate(profile) if row[0] == "ADD"}
     for index, (op, expected) in enumerate(zip(ops, profile)):
         name, h, w, ci, co, kernel, stride = expected
         label = f"{prefix} op {index}"
@@ -409,10 +430,10 @@ def validate_graph(tensors, ops, profile, blockers, subgraph):
         if len(inputs) != required_inputs or any(i < 0 or i >= len(tensors) for i in inputs + [output]):
             blockers.append(f"{label}: invalid tensor references or input count")
             continue
-        if legacy and index in (3, 6, 9, 12, 15):
+        if index in residual_starts:
             skip = current
         if name == "ADD":
-            if sorted(inputs) != sorted([current, skip]):
+            if skip is None or sorted(inputs) != sorted([current, skip]):
                 blockers.append(f"{label}: residual inputs do not match the block")
         elif inputs[0] != current:
             blockers.append(f"{label}: input does not follow the declared pipeline")
@@ -427,10 +448,8 @@ def validate_graph(tensors, ops, profile, blockers, subgraph):
         opts = op["options"]
         activation = "NONE"
         if kernel:
-            if not legacy or index < 3 or index in (19, 21):
-                activation = "NONE" if index == len(profile) - 1 else "RELU"
-            elif 3 <= index < 18 and (index - 3) % 3 == 0:
-                activation = "RELU"
+            linear = index == len(profile) - 1 or profile[index + 1][0] == "ADD"
+            activation = "NONE" if linear else "RELU"
             if opts.get("StrideH") != stride or opts.get("StrideW") != stride:
                 blockers.append(f"{label}: unexpected stride")
             weight, bias = tensors[inputs[1]], tensors[inputs[2]]
@@ -513,7 +532,7 @@ def audit_tflite(data, size, architecture=BN_ARCHITECTURE):
                 data_tensors.update(inputs[:2])
                 weight = graph.Tensors(inputs[1])
                 kernel = [weight.Shape(k) for k in range(weight.ShapeLength())]
-                valid_kernel = [3, 3] if name == "DEPTHWISE_CONV_2D" or architecture == BN_ARCHITECTURE else [1, 1]
+                valid_kernel = [1, 1] if name == "CONV_2D" and architecture == DW_ARCHITECTURE else [3, 3]
                 if len(kernel) != 4 or kernel[1:3] != valid_kernel:
                     blockers.append(f"subgraph {g} op {j}: unexpected convolution kernel")
                 if name == "DEPTHWISE_CONV_2D" and options.get("DepthMultiplier") != 1:
@@ -850,11 +869,12 @@ def main():
         "target_contract": {"batch": 1, "io_layout": "NHWC", "io_dtype": "int8",
                              "convolution": "zero SAME, dilation 1; DW multiplier 1; stride 2 pads right/bottom",
                              "upsampling": "two nearest-neighbor 2x resizes",
-                             "target": "640x480 at 60 fresh frames/s; unproven"},
+                             "target": "640x480 at 30 fresh frames/s; unproven"},
         "hardware_required": [
             "Nearest-neighbor 2x resize must execute in the hardware pipeline with identical input/output quantization.",
             "Pipeline boundary RGB preprocessing, scale/zero-point quantization and output dequantization/clipping need an explicit implementation and placement.",
-            "Register and strictly guard vendor Depthwise/Conv dispatch before any CPU fallback; verify STANDARD mode per layer.",
+            "Register the actual graph's Conv/Add/Resize operators (and Depthwise only when present); "
+            "strictly guard hardware dispatch before any CPU fallback and verify each layer's mode.",
             "Regenerate TinyML sizing for the actual model and parallelism; confirm op versions/options, per-channel quantization, SAME padding and memory/scheduling on Ti60."],
         "hardware_proven": False,
         "scope": "Software parity and FlatBuffer compatibility screen only; no Ti60 compilation, placement or hardware execution proof."}
