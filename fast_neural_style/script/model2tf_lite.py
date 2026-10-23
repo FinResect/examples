@@ -1,4 +1,4 @@
-"""Convert the metadata-bearing BN model to a candidate Ti60 int8 artifact.
+"""Convert metadata-bearing DW or legacy BN models to candidate Ti60 INT8 artifacts.
 
 Every invocation runs every stage. The old skip flags are intentionally removed.
 An operator audit is a necessary condition, not proof of hardware deployment.
@@ -17,9 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--model", required=True, help="Checkpoint with architecture/width/image_size metadata")
-    p.add_argument("--width", type=float, help="Consistency check only; checkpoint width must be 0.25")
+    p.add_argument("--model", required=True, help="Metadata-bearing unfused training checkpoint")
+    p.add_argument("--width", type=float, help="Legacy BN width consistency check only")
     p.add_argument("--size", type=int, help="Static square size; defaults to checkpoint image_size; multiple of 4")
+    p.add_argument("--height", type=int, help="Static input height; supply with --input-width")
+    p.add_argument("--input-width", type=int, help="Static input width; supply with --height")
     p.add_argument("--onnx", default="style.onnx")
     p.add_argument("--saved-model", default="saved_model", help="Parent for a fresh, retained run directory")
     p.add_argument("--int8-tflite", default="style_int8.tflite")
@@ -28,28 +30,91 @@ def parse_args():
     p.add_argument("--calib-count", type=int, default=100, help="Maximum calibration images (default: 100)")
     p.add_argument("--content", help="Verification image; defaults to first calibration image")
     p.add_argument("--output-image", help="Clipped verification PNG; defaults to <int8-tflite>.preview.png")
-    return p.parse_args()
+    args = p.parse_args()
+    if (args.height is None) != (args.input_width is None):
+        p.error("--height and --input-width must be supplied together")
+    if args.size is not None and args.height is not None:
+        p.error("--size is mutually exclusive with --height/--input-width")
+    if args.size is not None or args.height is not None:
+        try:
+            dimensions(args.size if args.size is not None else (args.height, args.input_width))
+        except ValueError as error:
+            p.error(str(error))
+    if args.calib_count <= 0:
+        p.error("--calib-count must be positive")
+    return args
 
 
 def preprocess(path, size):
-    """PIL Resize(int, BILINEAR) + CenterCrop, then ToTensor().mul(255)."""
+    """Shared RGB bilinear aspect-fill and center crop; NHWC float32 0..255."""
     import numpy as np
     from PIL import Image
+    from neural_style.preprocessing import resize_crop_image
 
     with Image.open(path) as source:
-        image = source.convert("RGB")
-        width, height = image.size
-        if width <= height:
-            resized = (size, int(size * height / width))
-        else:
-            resized = (int(size * width / height), size)
-        if image.size != resized:
-            image = image.resize(resized, resample=Image.Resampling.BILINEAR)
-        left = int(round((image.width - size) / 2.0))
-        top = int(round((image.height - size) / 2.0))
-        image = image.crop((left, top, left + size, top + size))
+        image = resize_crop_image(source, size)
         pixels = np.asarray(image, dtype=np.float32)
-    return (pixels / np.float32(255) * np.float32(255))[None]
+    return pixels[None]
+
+
+BN_ARCHITECTURE = "ti60_style_bn_3x3_v1"
+DW_ARCHITECTURE = "ti60_style_dw_c4_s_v1"
+
+
+def dimensions(size):
+    height, width = (size, size) if isinstance(size, int) else size
+    if any(type(n) is not int or n < 16 or n % 4 for n in (height, width)):
+        raise ValueError("Dimensions must be integers >=16 and divisible by four")
+    return height, width
+
+
+def expected_layers(architecture, height, width):
+    """Ordered (opcode, H, W, Cin, Cout, kernel, stride) deployment contract."""
+    if architecture == DW_ARCHITECTURE:
+        layers = []
+        h, w = height, width
+        for ci, stride in ((3, 2), (4, 2)) + ((4, 1),) * 5:
+            h, w = h // stride, w // stride
+            layers.extend([("DEPTHWISE_CONV_2D", h, w, ci, ci, 3, stride),
+                           ("CONV_2D", h, w, ci, 4, 1, 1)])
+        return layers + [("CONV_2D", h, w, 4, 4, 1, 1),
+                         ("RESIZE_NEAREST_NEIGHBOR", h * 2, w * 2, 4, 4, 0, 2),
+                         ("RESIZE_NEAREST_NEIGHBOR", height, width, 4, 4, 0, 2),
+                         ("CONV_2D", height, width, 4, 3, 1, 1)]
+    if architecture != BN_ARCHITECTURE:
+        raise ValueError("Unsupported deployment architecture")
+    h, w = height // 4, width // 4
+    layers = [("CONV_2D", height, width, 3, 8, 3, 1),
+              ("CONV_2D", height // 2, width // 2, 8, 16, 3, 2),
+              ("CONV_2D", h, w, 16, 32, 3, 2)]
+    for _ in range(5):
+        layers.extend([("CONV_2D", h, w, 32, 32, 3, 1),
+                       ("CONV_2D", h, w, 32, 32, 3, 1),
+                       ("ADD", h, w, 32, 32, 0, 1)])
+    return layers + [("RESIZE_NEAREST_NEIGHBOR", height // 2, width // 2, 32, 32, 0, 2),
+                     ("CONV_2D", height // 2, width // 2, 32, 16, 3, 1),
+                     ("RESIZE_NEAREST_NEIGHBOR", height, width, 16, 16, 0, 2),
+                     ("CONV_2D", height, width, 16, 8, 3, 1),
+                     ("CONV_2D", height, width, 8, 3, 3, 1)]
+
+
+def compute_budget(architecture, size):
+    height, width = dimensions(size)
+    layers = []
+    for name, h, w, ci, co, kernel, stride in expected_layers(architecture, height, width):
+        weights = kernel * kernel * co * (1 if name == "DEPTHWISE_CONV_2D" else ci)
+        macs = h * w * weights
+        layers.append({"name": name, "output_shape": [1, h, w, co], "input_channels": ci,
+                       "kernel": kernel, "stride": stride, "weight_bytes": weights, "macs": macs})
+    total = sum(layer["macs"] for layer in layers)
+    targets = []
+    for h, w, fps in ((480, 640, 15), (480, 640, 30), (480, 640, 60), (720, 1280, 60)):
+        macs = total * h * w // (height * width)
+        targets.append({"height": h, "width": w, "fps": fps, "macs_per_frame": macs,
+                        "required_gmac_per_second": macs * fps / 1e9})
+    return {"macs_per_frame": total, "weight_bytes": sum(x["weight_bytes"] for x in layers),
+            "layers": layers, "targets": targets,
+            "note": "Logical convolution MACs only; excludes resize, quantization, DMA and dispatch. Not measured FPS."}
 
 
 def metrics(reference, actual):
@@ -77,20 +142,91 @@ def require_parity(reference, actual, name, report):
 
 
 def signature_layout(spec, size):
+    height, width = dimensions(size)
     shape = spec.shape.as_list()
     if spec.dtype.name != "float32":
         raise ValueError(f"Expected float32 SavedModel signature, got {spec}")
-    if shape == [1, size, size, 3]:
+    if shape == [1, height, width, 3]:
         return "NHWC"
-    if shape == [1, 3, size, size]:
+    if shape == [1, 3, height, width]:
         return "NCHW"
     raise ValueError(f"SavedModel signature must be static batch 1 RGB: {spec}")
 
 
-def audit_tflite(data, size):
+def validate_graph(tensors, ops, profile, blockers, subgraph):
+    """Validate topology as well as counts, including linear heads and DW axes."""
+    prefix = f"subgraph {subgraph}"
+    if len(ops) != len(profile):
+        blockers.append(f"{prefix}: expected {len(profile)} operators, got {len(ops)}")
+        return
+    current = ops[0]["inputs"][0]
+    skip = None
+    legacy = any(row[0] == "ADD" for row in profile)
+    for index, (op, expected) in enumerate(zip(ops, profile)):
+        name, h, w, ci, co, kernel, stride = expected
+        label = f"{prefix} op {index}"
+        if op["name"] != name or len(op["outputs"]) != 1:
+            blockers.append(f"{label}: expected {name} with one output")
+            continue
+        inputs, output = op["inputs"], op["outputs"][0]
+        required_inputs = 3 if kernel else 2
+        if len(inputs) != required_inputs or any(i < 0 or i >= len(tensors) for i in inputs + [output]):
+            blockers.append(f"{label}: invalid tensor references or input count")
+            continue
+        if legacy and index in (3, 6, 9, 12, 15):
+            skip = current
+        if name == "ADD":
+            if sorted(inputs) != sorted([current, skip]):
+                blockers.append(f"{label}: residual inputs do not match the block")
+        elif inputs[0] != current:
+            blockers.append(f"{label}: input does not follow the declared pipeline")
+        src, dst = tensors[inputs[0]], tensors[output]
+        in_h = h * stride if kernel else h // stride if name == "RESIZE_NEAREST_NEIGHBOR" else h
+        in_w = w * stride if kernel else w // stride if name == "RESIZE_NEAREST_NEIGHBOR" else w
+        if src["shape"] != [1, in_h, in_w, ci] or dst["shape"] != [1, h, w, co]:
+            blockers.append(f"{label}: unexpected feature shapes/channels")
+        for tensor in [tensors[i] for i in inputs if i == current or name == "ADD"] + [dst]:
+            if tensor["dtype"] != "INT8" or len(tensor["scales"]) != 1:
+                blockers.append(f"{label}: activations must use per-tensor INT8 quantization")
+        opts = op["options"]
+        activation = "NONE"
+        if kernel:
+            if not legacy or index < 3 or index in (19, 21):
+                activation = "NONE" if index == len(profile) - 1 else "RELU"
+            elif 3 <= index < 18 and (index - 3) % 3 == 0:
+                activation = "RELU"
+            if opts.get("StrideH") != stride or opts.get("StrideW") != stride:
+                blockers.append(f"{label}: unexpected stride")
+            weight, bias = tensors[inputs[1]], tensors[inputs[2]]
+            dw = name == "DEPTHWISE_CONV_2D"
+            shape = [1, kernel, kernel, co] if dw else [co, kernel, kernel, ci]
+            if (weight["shape"] != shape or not weight["constant"] or
+                    weight["dtype"] != "INT8" or weight["quantized_dimension"] != (3 if dw else 0) or
+                    len(weight["scales"]) != co or weight["zero_points"] != [0] * co):
+                blockers.append(f"{label}: requires constant symmetric per-output-channel INT8 weights")
+            if (bias["shape"] != [co] or bias["dtype"] != "INT32" or not bias["constant"] or
+                    bias["quantized_dimension"] != 0 or len(bias["scales"]) != co or
+                    bias["zero_points"] != [0] * co):
+                blockers.append(f"{label}: requires constant per-channel INT32 bias")
+            elif len(src["scales"]) == 1 and len(weight["scales"]) == co:
+                if any(not math.isclose(b, src["scales"][0] * s, rel_tol=1e-5, abs_tol=1e-12)
+                       for b, s in zip(bias["scales"], weight["scales"])):
+                    blockers.append(f"{label}: bias scales differ from input_scale * weight_scale")
+        elif name == "RESIZE_NEAREST_NEIGHBOR":
+            shape_tensor = tensors[inputs[1]]
+            if shape_tensor["shape"] != [2] or not shape_tensor["constant"]:
+                blockers.append(f"{label}: requires constant two-element resize shape")
+        if opts.get("FusedActivationFunction", "NONE") != activation:
+            blockers.append(f"{label}: unexpected activation; RGB head and residual second conv must be linear")
+        current = output
+
+
+def audit_tflite(data, size, architecture=BN_ARCHITECTURE):
     """Read every subgraph using public generated FlatBuffer bindings, no delegates."""
     import tflite
 
+    height, width = dimensions(size)
+    profile = expected_layers(architecture, height, width)
     model = tflite.Model.GetRootAsModel(data, 0)
     enum_names = lambda cls: {v: k for k, v in vars(cls).items() if isinstance(v, int)}
     op_names = enum_names(tflite.BuiltinOperator)
@@ -98,7 +234,7 @@ def audit_tflite(data, size):
     activations = enum_names(tflite.ActivationFunctionType)
     paddings = enum_names(tflite.Padding)
     blockers, graphs, largest = [], [], None
-    allowed = {"CONV_2D", "ADD", "RESIZE_NEAREST_NEIGHBOR"}
+    allowed = {row[0] for row in profile}
     byte_sizes = {"INT8": 1, "INT32": 4, "INT64": 8, "FLOAT32": 4, "FLOAT16": 2, "UINT8": 1}
     if model.SubgraphsLength() != 1:
         blockers.append("Expected exactly one subgraph")
@@ -115,13 +251,13 @@ def audit_tflite(data, size):
             outputs = [int(op.Outputs(k)) for k in range(op.OutputsLength())]
             options = {}
             table = op.BuiltinOptions()
-            option_class = {"CONV_2D": "Conv2DOptions", "ADD": "AddOptions",
+            option_class = {"CONV_2D": "Conv2DOptions", "DEPTHWISE_CONV_2D": "DepthwiseConv2DOptions", "ADD": "AddOptions",
                             "RESIZE_NEAREST_NEIGHBOR": "ResizeNearestNeighborOptions"}.get(name)
             if table is not None and option_class:
                 obj = getattr(tflite, option_class)()
                 obj.Init(table.Bytes, table.Pos)
                 for field in ("Padding", "StrideH", "StrideW", "DilationHFactor", "DilationWFactor",
-                              "FusedActivationFunction", "AlignCorners", "HalfPixelCenters", "PotScaleInt16"):
+                               "FusedActivationFunction", "AlignCorners", "HalfPixelCenters", "PotScaleInt16", "DepthMultiplier"):
                     if hasattr(obj, field):
                         value = getattr(obj, field)()
                         if field == "Padding":
@@ -136,18 +272,24 @@ def audit_tflite(data, size):
                 blockers.append(f"subgraph {g} op {j}: unsupported {name}; ReLU must be fused")
             if options.get("FusedActivationFunction", "NONE") not in ("NONE", "RELU"):
                 blockers.append(f"subgraph {g} op {j}: unsupported fused activation")
-            if name == "CONV_2D" and len(inputs) == 3:
+            if name in ("CONV_2D", "DEPTHWISE_CONV_2D") and len(inputs) == 3:
                 bias_or_shape.add(inputs[2])
                 data_tensors.update(inputs[:2])
                 weight = graph.Tensors(inputs[1])
                 kernel = [weight.Shape(k) for k in range(weight.ShapeLength())]
-                if len(kernel) != 4 or kernel[1:3] != [3, 3]:
-                    blockers.append(f"subgraph {g} op {j}: convolution kernel is not 3x3")
-                if (options.get("Padding") != "SAME" or
+                valid_kernel = [3, 3] if name == "DEPTHWISE_CONV_2D" or architecture == BN_ARCHITECTURE else [1, 1]
+                if len(kernel) != 4 or kernel[1:3] != valid_kernel:
+                    blockers.append(f"subgraph {g} op {j}: unexpected convolution kernel")
+                if name == "DEPTHWISE_CONV_2D" and options.get("DepthMultiplier") != 1:
+                    blockers.append(f"subgraph {g} op {j}: depth_multiplier must be one")
+                # A 1x1 stride-one filter has no boundary padding in either mode.
+                valid_padding = options.get("Padding") == "SAME" or (
+                    kernel[1:3] == [1, 1] and options.get("StrideH") == 1 and options.get("Padding") == "VALID")
+                if (not valid_padding or
                         options.get("StrideH") not in (1, 2) or
                         options.get("StrideH") != options.get("StrideW") or
                         options.get("DilationHFactor") != 1 or options.get("DilationWFactor") != 1):
-                    blockers.append(f"subgraph {g} op {j}: requires zero SAME, stride 1/2, dilation 1")
+                    blockers.append(f"subgraph {g} op {j}: requires SAME (or equivalent 1x1 VALID), stride 1/2, dilation 1")
             elif name == "RESIZE_NEAREST_NEIGHBOR" and len(inputs) == 2:
                 bias_or_shape.add(inputs[1])
                 data_tensors.add(inputs[0])
@@ -186,24 +328,24 @@ def audit_tflite(data, size):
             blockers.append(f"subgraph {g}: expected one input and one output")
         for j in inputs + outputs:
             tensor = tensors[j]
-            if tensor["shape"] != [1, size, size, 3] or tensor["dtype"] != "INT8" or len(tensor["scales"]) != 1:
-                blockers.append(f"subgraph {g} IO tensor {j}: requires static NHWC [1,{size},{size},3], per-tensor int8")
+            if tensor["shape"] != [1, height, width, 3] or tensor["dtype"] != "INT8" or len(tensor["scales"]) != 1:
+                blockers.append(f"subgraph {g} IO tensor {j}: requires static NHWC [1,{height},{width},3], per-tensor int8")
+        if ops and (ops[0]["inputs"][:1] != inputs or ops[-1]["outputs"] != outputs):
+            blockers.append(f"subgraph {g}: graph IO does not match the declared pipeline endpoints")
         for op in ops:
             if op["name"] == "RESIZE_NEAREST_NEIGHBOR":
-                if op["options"].get("AlignCorners", False):
-                    blockers.append(f"subgraph {g} op {op['index']}: align_corners resize is not pixel repetition")
+                if op["options"].get("AlignCorners", False) or op["options"].get("HalfPixelCenters", False):
+                    blockers.append(f"subgraph {g} op {op['index']}: both resize coordinate flags must be false")
                 src, dst = tensors[op["inputs"][0]], tensors[op["outputs"][0]]
                 if src["scales"] != dst["scales"] or src["zero_points"] != dst["zero_points"]:
                     blockers.append(f"subgraph {g} op {op['index']}: resize quantization must be identical")
                 s, d = src["shape"], dst["shape"]
                 if len(s) != 4 or d != [s[0], s[1] * 2, s[2] * 2, s[3]]:
                     blockers.append(f"subgraph {g} op {op['index']}: resize must be nearest 2x NHWC")
-        counts = {name: sum(op["name"] == name for op in ops) for name in allowed}
-        if counts != {"CONV_2D": 16, "ADD": 5, "RESIZE_NEAREST_NEIGHBOR": 2}:
-            blockers.append(f"subgraph {g}: expected 16 convolutions, 5 residual adds, 2 resizes; got {counts}")
-        if sum(op["name"] == "CONV_2D" and op["options"].get("StrideH") == 2 for op in ops) != 2:
-            blockers.append(f"subgraph {g}: expected exactly two stride-2 convolutions")
-        graphs.append({"index": g, "inputs": inputs, "outputs": outputs, "operators": ops, "tensors": tensors})
+        validate_graph(tensors, ops, profile, blockers, g)
+        graphs.append({"index": g, "inputs": inputs, "outputs": outputs, "operators": ops, "tensors": tensors,
+                       "operator_counts": {name: sum(op["name"] == name for op in ops)
+                                           for name in sorted({op["name"] for op in ops})}})
     return {"blockers": blockers, "passed": not blockers, "model_bytes": len(data),
             "largest_tensor": largest, "memory_note": "Largest logical tensor only; not an arena or peak RAM estimate.",
             "subgraphs": graphs}
@@ -256,8 +398,12 @@ def canonicalize_convolutions(model):
         shape = shapes.get(node.input[0], [])
         kernel = constants[node.input[1]].shape[2:]
         strides = attrs.get("strides", [1, 1])
-        if len(shape) != 4 or min(shape) <= 0 or tuple(kernel) != (3, 3) or attrs.get("dilations", [1, 1]) != [1, 1]:
-            raise ValueError("Expected static 3x3 convolution with dilation one")
+        weight = constants[node.input[1]]
+        group = attrs.get("group", 1)
+        depthwise = len(shape) == 4 and group == shape[1] and weight.shape[0] == shape[1] and weight.shape[1] == 1
+        if (len(shape) != 4 or min(shape) <= 0 or tuple(kernel) not in ((3, 3), (1, 1)) or
+                attrs.get("dilations", [1, 1]) != [1, 1] or (group != 1 and not depthwise)):
+            raise ValueError("Expected static dense or multiplier-one depthwise convolution, dilation one")
         total = [max(((n + s - 1) // s - 1) * s + k - n, 0)
                  for n, s, k in zip(shape[2:], strides, kernel)]
         expected = [p // 2 for p in total] + [p - p // 2 for p in total]
@@ -281,25 +427,30 @@ def convert(a, report):
     if not hasattr(transformer_net, "load_checkpoint"):
         raise ValueError("Model module must expose load_checkpoint(path) and net.fused(); legacy checkpoints are unsupported")
     net, metadata = transformer_net.load_checkpoint(a.model)
-    if not isinstance(metadata, dict) or not all(k in metadata for k in ("architecture", "width", "image_size")):
-        raise ValueError("Checkpoint requires architecture, width and image_size metadata")
-    if not isinstance(metadata["architecture"], str) or not metadata["architecture"]:
-        raise ValueError("Checkpoint architecture must be a nonempty identifier")
-    width = float(metadata["width"])
-    if not math.isclose(width, 0.25, rel_tol=0, abs_tol=1e-9):
-        raise ValueError(f"Ti60 conversion requires checkpoint width 0.25, got {width}")
-    if a.width is not None and not math.isclose(a.width, width, rel_tol=0, abs_tol=1e-9):
-        raise ValueError("--width differs from checkpoint metadata; it cannot change the architecture")
-    a.size = a.size if a.size is not None else metadata["image_size"]
-    if isinstance(a.size, bool) or not isinstance(a.size, int) or a.size < 16 or a.size % 4:
-        raise ValueError("Image size must be a positive integer multiple of 4 (at least 16)")
-    if a.calib_count <= 0:
-        raise ValueError("--calib-count must be positive")
+    checkpoint_shape = transformer_net.checkpoint_dimensions(metadata)
+    architecture = metadata["architecture"]
+    if architecture == BN_ARCHITECTURE:
+        width = float(metadata["width"])
+        if not math.isclose(width, 0.25, rel_tol=0, abs_tol=1e-9):
+            raise ValueError(f"Legacy Ti60 conversion requires width 0.25, got {width}")
+        if a.width is not None and not math.isclose(a.width, width, rel_tol=0, abs_tol=1e-9):
+            raise ValueError("--width differs from checkpoint metadata")
+    elif a.width is not None:
+        raise ValueError("--width is only supported for the legacy BN architecture")
+    a.size = dimensions((a.height, a.input_width) if a.height is not None else
+                        a.size if a.size is not None else checkpoint_shape)
+    height, image_width = a.size
     files = sorted(p for p in Path(a.calib).rglob("*") if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png"})[:a.calib_count]
     if not files:
         raise ValueError(f"No calibration jpg/jpeg/png images under {a.calib}")
-    report.update(metadata=metadata, size=a.size, calibration={"count": len(files), "files": [str(p.resolve()) for p in files],
-                  "preprocessing": "RGB PIL bilinear shorter-edge Resize, CenterCrop, float32 RGB 0..255"})
+    report.update(metadata=metadata, size=list(a.size), input_shape=[1, height, image_width, 3],
+                  compute=compute_budget(architecture, a.size),
+                  calibration={"count": len(files), "files": [str(p.resolve()) for p in files],
+                  "preprocessing": "RGB PIL bilinear aspect-fill Resize, CenterCrop, float32 RGB 0..255"})
+    report["target_contract"].update(architecture=architecture,
+        input_shape=[1, height, image_width, 3],
+        operator_counts={name: sum(row[0] == name for row in expected_layers(architecture, *a.size))
+                         for name in sorted({row[0] for row in expected_layers(architecture, *a.size)})})
     if any(m.training for m in net.modules()) or any(t.device.type != "cpu" for t in list(net.parameters()) + list(net.buffers())):
         raise ValueError("load_checkpoint must return an eval CPU model")
     fused = net.fused()
@@ -314,14 +465,19 @@ def convert(a, report):
            for t in list(fused.parameters()) + list(fused.buffers())):
         raise ValueError("fused() must deepcopy the model, not share parameter/buffer storage")
     convs = [m for m in fused.modules() if isinstance(m, torch.nn.Conv2d)]
-    if (len(convs) != 16 or any(m.kernel_size != (3, 3) or m.padding_mode != "zeros" for m in convs)
-            or convs[0].in_channels != 3 or convs[0].out_channels != 8 or convs[-1].out_channels != 3):
-        raise ValueError("Expected width .25 RGB architecture with sixteen 3x3 zero-padded convolutions")
+    expected_convs = [row for row in expected_layers(architecture, *a.size) if row[5]]
+    if len(convs) != len(expected_convs):
+        raise ValueError("Unexpected convolution count in checkpoint")
+    for conv, (name, _, _, ci, co, kernel, stride) in zip(convs, expected_convs):
+        if (conv.in_channels != ci or conv.out_channels != co or conv.kernel_size != (kernel, kernel) or
+                conv.groups != (ci if name == "DEPTHWISE_CONV_2D" else 1) or
+                conv.stride != (stride, stride) or conv.dilation != (1, 1) or conv.padding_mode != "zeros"):
+            raise ValueError("Checkpoint convolution differs from deployment profile")
     image = preprocess(a.content or files[0], a.size)
     rng = np.random.default_rng(0)
     probes = [image.transpose(0, 3, 1, 2).copy(),
-              rng.uniform(0, 255, (1, 3, a.size, a.size)).astype(np.float32),
-              np.zeros((1, 3, a.size, a.size), dtype=np.float32)]
+               rng.uniform(0, 255, (1, 3, height, image_width)).astype(np.float32),
+               np.zeros((1, 3, height, image_width), dtype=np.float32)]
     references = []
     with torch.inference_mode():
         for i, x in enumerate(probes):
@@ -380,7 +536,7 @@ def convert(a, report):
     data = converter.convert()
     Path(a.int8_tflite).write_bytes(data)
     report["artifacts"]["int8_tflite"] = str(Path(a.int8_tflite).resolve())
-    report["audit"] = audit_tflite(data, a.size)
+    report["audit"] = audit_tflite(data, a.size, architecture)
     report["blockers"].extend(report["audit"]["blockers"])
     if report["blockers"]:
         return
@@ -430,13 +586,15 @@ def main():
         print("Output paths must be distinct and must not overwrite input images/checkpoints", file=sys.stderr)
         return 2
     report = {"status": "failed", "target": "Ti60", "blockers": [], "parity": {}, "artifacts": {},
-        "target_contract": {"width": 0.25, "batch": 1, "io_layout": "NHWC", "io_dtype": "int8",
-                            "convolution": "3x3 zero SAME; stride 2 on even sizes pads right/bottom by 1",
-                            "residual_blocks": 5, "upsampling": "two nearest-neighbor 2x resizes"},
+        "target_contract": {"batch": 1, "io_layout": "NHWC", "io_dtype": "int8",
+                             "convolution": "zero SAME, dilation 1; DW multiplier 1; stride 2 pads right/bottom",
+                             "upsampling": "two nearest-neighbor 2x resizes",
+                             "target": "640x480 at 60 fresh frames/s; unproven"},
         "hardware_required": [
             "Nearest-neighbor 2x resize must execute in the hardware pipeline with identical input/output quantization.",
             "Pipeline boundary RGB preprocessing, scale/zero-point quantization and output dequantization/clipping need an explicit implementation and placement.",
-            "Confirm compiler support for reported op versions/options, per-channel quantization, residual requantization, SAME padding and memory/scheduling on Ti60."],
+            "Register and strictly guard vendor Depthwise/Conv dispatch before any CPU fallback; verify STANDARD mode per layer.",
+            "Regenerate TinyML sizing for the actual model and parallelism; confirm op versions/options, per-channel quantization, SAME padding and memory/scheduling on Ti60."],
         "hardware_proven": False,
         "scope": "Software parity and FlatBuffer compatibility screen only; no Ti60 compilation, placement or hardware execution proof."}
     try:
