@@ -5,6 +5,7 @@ An operator audit is a necessary condition, not proof of hardware deployment.
 """
 
 import argparse
+import copy
 import json
 import math
 from pathlib import Path
@@ -136,15 +137,97 @@ def metrics(reference, actual):
             "rmse": math.sqrt(mse), "psnr_255_db": 10 * math.log10(255 ** 2 / mse) if mse else None}
 
 
-def require_parity(reference, actual, name, report):
+def parity_metrics(reference, actual):
     import numpy as np
 
     result = metrics(reference, actual)
     result.update(atol=0.01, rtol=0.0001)
-    result["passed"] = bool(np.allclose(reference, actual, atol=0.01, rtol=0.0001))
+    close = np.isclose(reference, actual, atol=0.01, rtol=0.0001)
+    result["passed"] = bool(np.all(close))
+    result["failed_elements"] = int(np.count_nonzero(~close))
+    if not result["passed"]:
+        delta = np.abs(reference.astype(np.float64) - actual.astype(np.float64))
+        allowed = 0.01 + 0.0001 * np.abs(actual.astype(np.float64))
+        ratios = np.where(close, -1, delta / allowed)
+        index = np.unravel_index(int(np.argmax(ratios)), ratios.shape)
+        result["worst_failure"] = {
+            "index": [int(value) for value in index],
+            "reference": float(reference[index]), "actual": float(actual[index]),
+            "abs_error": float(delta[index]), "allowed_error": float(allowed[index]),
+            "tolerance_ratio": float(ratios[index]),
+        }
+    return result
+
+
+def require_parity(reference, actual, name, report):
+    result = parity_metrics(reference, actual)
     report["parity"][name] = result
     if not result["passed"]:
         raise ValueError(f"{name} parity failed: {result}")
+
+
+def diagnose_bn_folding(net, fused, inputs, reference, actual):
+    import torch
+    from neural_style.transformer_net import ConvLayer
+
+    def layer_outputs(model):
+        outputs, handles = {}, []
+        for name, module in model.named_modules():
+            if isinstance(module, ConvLayer):
+                def capture_output(module, arguments, output, layer_name=name):
+                    outputs[layer_name] = output.detach().cpu().numpy().copy()
+                handles.append(module.register_forward_hook(capture_output))
+        try:
+            model(inputs)
+        finally:
+            for handle in handles:
+                handle.remove()
+        return outputs
+
+    with torch.inference_mode():
+        reference64_net = copy.deepcopy(net).double()
+        fused64 = reference64_net.fused()
+        fused64_to32 = copy.deepcopy(fused64).float()
+        fused32_to64 = copy.deepcopy(fused).double()
+        inputs64 = inputs.double()
+        reference64 = reference64_net(inputs64).cpu().numpy()
+        folded64 = fused64(inputs64).cpu().numpy()
+        folded64_to32 = fused64_to32(inputs).cpu().numpy()
+        folded32_to64 = fused32_to64(inputs64).cpu().numpy()
+        comparisons = {
+            "unfused_fp64_vs_fused_fp64": parity_metrics(reference64, folded64),
+            "unfused_fp64_vs_unfused_fp32": parity_metrics(reference64, reference),
+            "unfused_fp64_vs_fused_fp32": parity_metrics(reference64, actual),
+            "unfused_fp64_vs_fused_fp32_to_fp64": parity_metrics(reference64, folded32_to64),
+            "unfused_fp32_vs_fused_fp64_to_fp32": parity_metrics(reference, folded64_to32),
+            "unfused_fp64_vs_fused_fp64_to_fp32": parity_metrics(reference64, folded64_to32),
+        }
+        original_layers, folded_layers = layer_outputs(net), layer_outputs(fused)
+        layers = []
+        for name, layer in net.named_modules():
+            if not isinstance(layer, ConvLayer):
+                continue
+            entry = {"name": name, "parity": parity_metrics(original_layers[name], folded_layers[name])}
+            if isinstance(layer.bn, torch.nn.BatchNorm2d):
+                batchnorm = layer.bn
+                scale = batchnorm.weight.double() * torch.rsqrt(batchnorm.running_var.double() + batchnorm.eps)
+                entry["batchnorm"] = {
+                    "eps": batchnorm.eps,
+                    "running_var_min": float(batchnorm.running_var.min()),
+                    "running_var_max": float(batchnorm.running_var.max()),
+                    "running_mean_abs_max": float(batchnorm.running_mean.abs().max()),
+                    "scale_abs_max": float(scale.abs().max()),
+                }
+            layers.append(entry)
+    first_failed_layer = next((layer["name"] for layer in layers if not layer["parity"]["passed"]), None)
+    return {
+        "torch_version": str(torch.__version__),
+        "mkldnn_enabled": bool(torch.backends.mkldnn.enabled), "threads": torch.get_num_threads(),
+        "input_shape": list(inputs.shape), "comparisons": comparisons,
+        "first_failed_layer": first_failed_layer, "layers": layers,
+        "scope": "Read-only diagnostics for the failing probe. No weights, tolerances or conversion gates are changed.",
+        "layer_note": "Layer outputs include upstream errors; first_failed_layer is localization, not proof of a faulty layer.",
+    }
 
 
 def signature_layout(spec, size):
@@ -504,7 +587,25 @@ def convert(a, report):
             out = fused(torch.from_numpy(x)).numpy()
             if out.shape != x.shape:
                 raise ValueError(f"Model output must preserve RGB image shape, got {out.shape}")
-            require_parity(ref, out, f"pytorch_unfused_vs_fused_{i}", report)
+            try:
+                require_parity(ref, out, f"pytorch_unfused_vs_fused_{i}", report)
+            except ValueError:
+                try:
+                    diagnostics = diagnose_bn_folding(net, fused, torch.from_numpy(x), ref, out)
+                    diagnostics["probe_index"] = i
+                    report["folding_diagnostics"] = diagnostics
+                    for name, comparison in diagnostics["comparisons"].items():
+                        print(f"[folding] {name}: passed={comparison['passed']} "
+                              f"max_abs={comparison['max_abs']:.8g} failed_elements={comparison['failed_elements']}",
+                              file=sys.stderr, flush=True)
+                    print(f"[folding] first_failed_layer={diagnostics['first_failed_layer']}",
+                          file=sys.stderr, flush=True)
+                except Exception as diagnostic_error:
+                    report["folding_diagnostics"] = {
+                        "probe_index": i, "error": f"{type(diagnostic_error).__name__}: {diagnostic_error}",
+                        "traceback": traceback.format_exc(),
+                    }
+                raise
             references.append(out)
         record_stage(report, "onnx_export")
         torch.onnx.export(fused, torch.from_numpy(probes[0]), a.onnx, opset_version=13,

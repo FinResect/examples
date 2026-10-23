@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from script import model2tf_lite as converter
 from script.model2tf_lite import (
     BN_ARCHITECTURE, DW_ARCHITECTURE, compute_budget, expected_layers,
-    metrics, preprocess, require_parity, validate_graph,
+    diagnose_bn_folding, metrics, parity_metrics, preprocess, require_parity, validate_graph,
 )
 
 HAS_TORCH = importlib.util.find_spec("torch") is not None
@@ -167,6 +167,29 @@ class ConversionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             metrics(reference, reference[:, :, :2])
 
+    def test_parity_reports_worst_tolerance_failure_not_largest_absolute_error(self):
+        reference = np.array([0, 1000], dtype=np.float32)
+        actual = np.array([0.02, 1000.05], dtype=np.float32)
+        result = parity_metrics(reference, actual)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["failed_elements"], 1)
+        self.assertEqual(result["worst_failure"]["index"], [0])
+        self.assertAlmostEqual(result["worst_failure"]["abs_error"], 0.02)
+        self.assertGreater(result["max_abs"], result["worst_failure"]["abs_error"])
+        self.assertGreater(result["worst_failure"]["tolerance_ratio"], 1)
+        json.dumps(result, allow_nan=False)
+
+    def test_parity_diagnostics_preserve_existing_acceptance(self):
+        reference = np.array([-100, 0, 1000], dtype=np.float32)
+        for offset in (0, 0.009, 0.02, 1):
+            with self.subTest(offset=offset):
+                actual = reference + offset
+                result = parity_metrics(reference, actual)
+                self.assertEqual(result["passed"], bool(np.allclose(reference, actual, atol=0.01, rtol=0.0001)))
+                self.assertEqual(result["failed_elements"], int(np.count_nonzero(
+                    ~np.isclose(reference, actual, atol=0.01, rtol=0.0001))))
+        self.assertNotIn("worst_failure", parity_metrics(reference, reference))
+
 
 class GraphValidationTests(unittest.TestCase):
     def dw_graph(self):
@@ -272,6 +295,40 @@ class GraphValidationTests(unittest.TestCase):
 
 @unittest.skipUnless(HAS_TORCH, "PyTorch is not installed")
 class ModelTests(unittest.TestCase):
+    def test_folding_diagnostics_preserve_models_and_remove_hooks(self):
+        import torch
+        from neural_style.transformer_net import DWTransformerNet
+
+        torch.set_num_threads(1)
+        torch.manual_seed(12)
+        net = DWTransformerNet().eval()
+        with torch.no_grad():
+            for layer in net.modules():
+                if isinstance(layer, torch.nn.BatchNorm2d):
+                    layer.running_mean.uniform_(-0.5, 0.5)
+                    layer.running_var.uniform_(0.5, 2)
+                    layer.weight.uniform_(0.5, 1.5)
+                    layer.bias.uniform_(-0.2, 0.2)
+            fused = net.fused()
+            inputs = torch.rand(1, 3, 16, 20) * 255
+            reference, actual = net(inputs).numpy(), fused(inputs).numpy()
+            states = [{name: value.clone() for name, value in model.state_dict().items()}
+                      for model in (net, fused)]
+            diagnostics = diagnose_bn_folding(net, fused, inputs, reference, actual)
+        self.assertEqual(diagnostics["input_shape"], [1, 3, 16, 20])
+        self.assertEqual(len(diagnostics["layers"]), 16)
+        self.assertEqual(sum("batchnorm" in layer for layer in diagnostics["layers"]), 15)
+        self.assertTrue(diagnostics["comparisons"]["unfused_fp64_vs_fused_fp64"]["passed"])
+        for model, state in zip((net, fused), states):
+            for name, value in model.state_dict().items():
+                torch.testing.assert_close(value, state[name], atol=0, rtol=0)
+            self.assertFalse(any(module._forward_hooks for module in model.modules()))
+        self.assertIs(next(net.parameters()).dtype, torch.float32)
+        self.assertIs(next(fused.parameters()).dtype, torch.float32)
+        self.assertFalse(net.training)
+        self.assertFalse(fused.training)
+        json.dumps(diagnostics, allow_nan=False)
+
     @unittest.skipUnless(all(importlib.util.find_spec(m) is not None for m in ("onnx", "onnxsim", "onnxruntime")),
                          "ONNX conversion dependencies are not installed")
     def test_export_canonicalizes_padding_without_changing_values(self):
