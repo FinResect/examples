@@ -98,6 +98,33 @@ class ModelTests(unittest.TestCase):
             result = layer(torch.arange(16, dtype=torch.float32).reshape(1, 1, 4, 4))
         torch.testing.assert_close(result, torch.tensor([[[[45., 39.], [66., 50.]]]]))
 
+    def test_stream_student_shapes_and_folding(self):
+        import torch
+        from neural_style.stream_net import StreamStudentNet, save_stream_checkpoint, load_stream_checkpoint
+        from neural_style.transformer_net import load_any_teacher
+
+        torch.set_num_threads(1)
+        torch.manual_seed(42)
+        student = StreamStudentNet(dilation=2).eval()
+        x = torch.rand(1, 3, 64, 64) * 255.0
+        out = student(x)
+        self.assertEqual(out.shape, (1, 3, 64, 64))
+
+        fused = student.fused()
+        out_fused = fused(x)
+        torch.testing.assert_close(out, out_fused, atol=1e-4, rtol=1e-4)
+
+        w0, b0 = student.layers[0].folded()
+        self.assertEqual(w0.shape, (3, 3, 3, 4))
+        self.assertEqual(b0.shape, (4,))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "student.pt"
+            save_stream_checkpoint(path, student, 64)
+            restored, meta = load_stream_checkpoint(path)
+            self.assertEqual(meta["dilation"], 2)
+            torch.testing.assert_close(restored(x), out)
+
     def test_checkpoint_retains_bn_and_rejects_legacy(self):
         import torch
         from neural_style.transformer_net import TransformerNet, load_checkpoint, save_checkpoint

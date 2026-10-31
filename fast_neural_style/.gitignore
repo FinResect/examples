@@ -1,0 +1,20 @@
+# Python and Virtual Environments
+.venv*/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary intermediate models and outputs
+output/
+saved_model/
+*.onnx
+*.tflite
+*.bin
+*.report.json
+*.preview.png
+
+# PyTorch checkpoints (keep repository light, user models stored in model/)
+checkpoint/
+checkpoints/

@@ -11,6 +11,37 @@ import utils
 from transformer_net import TransformerNet, load_checkpoint, save_checkpoint
 
 
+class FlatImageFolder(torch.utils.data.Dataset):
+    def __init__(self, root, transform=None):
+        self.root = Path(root)
+        self.transform = transform
+        valid_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        self.samples = [p for p in self.root.rglob("*") if p.is_file() and p.suffix.lower() in valid_exts]
+        if not self.samples:
+            raise FileNotFoundError(f"No valid image files found in {root}")
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        from PIL import Image
+        with open(self.samples[idx], "rb") as f:
+            img = Image.open(f).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, 0
+
+
+def load_dataset(dataset_path, transform):
+    try:
+        ds = datasets.ImageFolder(dataset_path, transform)
+        if len(ds) > 0:
+            return ds
+    except Exception:
+        pass
+    return FlatImageFolder(dataset_path, transform)
+
+
 def image_transform(size):
     return transforms.Compose([
         transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -23,7 +54,7 @@ def train(args, device):
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    dataset = datasets.ImageFolder(args.dataset, image_transform(args.image_size))
+    dataset = load_dataset(args.dataset, image_transform(args.image_size))
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                         num_workers=args.workers, pin_memory=device.type == "cuda")
     model = TransformerNet(args.width).to(device).train()
@@ -67,8 +98,16 @@ def train(args, device):
             if checkpoint_dir and step % args.checkpoint_interval == 0:
                 save_checkpoint(checkpoint_dir / f"epoch_{epoch}_batch_{step}.model",
                                 model, args.image_size, epoch=epoch, batch=step)
-        path = output_dir / f"ti60_epoch_{epoch}_{time.strftime('%Y%m%d_%H%M%S')}.model"
-        save_checkpoint(path, model, args.image_size, epoch=epoch)
+        if getattr(args, "name", None):
+            path = output_dir / f"{args.name}_epoch_{epoch}.model"
+            save_checkpoint(path, model, args.image_size, epoch=epoch)
+            if epoch == args.epochs:
+                latest_path = output_dir / f"{args.name}.model"
+                save_checkpoint(latest_path, model, args.image_size, epoch=epoch)
+                print(f"Saved {latest_path}", flush=True)
+        else:
+            path = output_dir / f"ti60_epoch_{epoch}_{time.strftime('%Y%m%d_%H%M%S')}.model"
+            save_checkpoint(path, model, args.image_size, epoch=epoch)
         print(f"Saved {path}", flush=True)
 
 
@@ -98,6 +137,7 @@ def main():
     training.add_argument("--dataset", required=True)
     training.add_argument("--style-image", required=True)
     training.add_argument("--save-model-dir", required=True)
+    training.add_argument("--name", default=None, help="model name identifier (e.g. monet, custom)")
     training.add_argument("--checkpoint-model-dir")
     training.add_argument("--epochs", type=int, default=2)
     training.add_argument("--batch-size", type=int, default=4)

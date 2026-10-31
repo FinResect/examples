@@ -344,7 +344,7 @@ def convert(a, report):
     report["artifacts"]["onnx"] = str(Path(a.onnx).resolve())
     saved = Path(tempfile.mkdtemp(prefix="run-", dir=a.saved_model))
     report["artifacts"]["saved_model"] = str(saved.resolve())
-    subprocess.run(["onnx2tf", "-i", str(Path(a.onnx).resolve()), "-o", str(saved.resolve()), "-b", "1"], check=True)
+    subprocess.run([sys.executable, "-m", "onnx2tf", "-i", str(Path(a.onnx).resolve()), "-o", str(saved.resolve()), "-b", "1"], check=True)
     loaded = tf.saved_model.load(str(saved))
     if "serving_default" not in loaded.signatures:
         raise ValueError("SavedModel lacks serving_default signature")
